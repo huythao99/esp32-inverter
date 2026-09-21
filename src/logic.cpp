@@ -161,29 +161,46 @@ void applyCurrentValue() {
   bool sched = false;
   const char* source = "setting";
 
-  // Read shared state under the mutex. Keep the critical section short: the
-  // only potentially slow call inside is getLocalTime() (<=10ms).
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    return;  // couldn't get the lock this cycle; retry in intervalApply
+  // 0. Blacklist lock (absolute highest priority — server kill switch).
+  //    Overrides share/schedule/setting. Re-sent on the keepalive below so a
+  //    rebooted STM32 re-locks. deviceLocked/unlockPending are only touched on
+  //    Core 1 (MQTT callback + here), so no mutex is needed for them.
+  if (deviceLocked) {
+    out = "*LOCK12345#";
+    source = "lock";
+  } else if (unlockPending) {
+    // One-shot unlock pulse: emit *UNLOCK54321# once, then resume normal values
+    // on the next cycle (out differs from this, so it writes immediately).
+    unlockPending = false;
+    out = "*UNLOCK54321#";
+    source = "unlock";
   }
 
-  // 1. Share (highest) — only while fresh.
-  if (activeShareValue >= 0 && (millis() - activeShareAt) < (unsigned long)shareValidMs) {
-    out = buildShareValue(activeShareValue);
-    source = "share";
-  }
-  // 2. Schedule
   if (out.isEmpty()) {
-    out = currentScheduleValue();
-    if (!out.isEmpty()) { sched = true; source = "schedule"; }
-  }
-  // 3. Base setting
-  if (out.isEmpty()) {
-    out = lastSetupValue;
-  }
-  scheduleActive = sched;
+    // Read shared state under the mutex. Keep the critical section short: the
+    // only potentially slow call inside is getLocalTime() (<=10ms).
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+      return;  // couldn't get the lock this cycle; retry in intervalApply
+    }
 
-  xSemaphoreGive(stateMutex);
+    // 1. Share (highest) — only while fresh.
+    if (activeShareValue >= 0 && (millis() - activeShareAt) < (unsigned long)shareValidMs) {
+      out = buildShareValue(activeShareValue);
+      source = "share";
+    }
+    // 2. Schedule
+    if (out.isEmpty()) {
+      out = currentScheduleValue();
+      if (!out.isEmpty()) { sched = true; source = "schedule"; }
+    }
+    // 3. Base setting
+    if (out.isEmpty()) {
+      out = lastSetupValue;
+    }
+    scheduleActive = sched;
+
+    xSemaphoreGive(stateMutex);
+  }
 
   if (out.isEmpty()) return;   // nothing known yet
 

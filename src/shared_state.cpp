@@ -22,6 +22,7 @@ String MQTT_TOPIC_OTA_STATUS;
 String MQTT_TOPIC_CMD_SETTINGS;
 String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
+String MQTT_TOPIC_BLACKLIST;
 
 // ---- Command sync flags ---------------------------------------------------
 volatile bool cmdSettingsPending = false;
@@ -43,6 +44,10 @@ const long    shareDebounceMs = 100;
 
 // ---- OTA trigger ----------------------------------------------------------
 volatile bool otaPending = false;
+
+// ---- Blacklist / device lock ----------------------------------------------
+volatile bool deviceLocked  = false;
+volatile bool unlockPending  = false;
 
 // ---- Identity / config ----------------------------------------------------
 String uid;

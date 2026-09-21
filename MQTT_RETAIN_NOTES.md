@@ -26,6 +26,13 @@ Khi device reconnect và subscribe lại, broker tự push retained message cu�
 - **Payload**: `{"value": 1234}`
 - **retain=true** để device nhận share value mới nhất ngay khi vừa reconnect, thay vì chờ lần push tiếp theo
 
+### 4. `inverter/{uid}/{deviceId}/blacklist`
+- **Trigger**: server khóa / mở khóa device (kill switch)
+- **Payload**: `{"lock": true}` (khóa) hoặc `{"lock": false}` (mở khóa)
+- **retain=true** — **quan trọng**: nếu device đang bị khóa mà reboot/reconnect, không có retained message thì device sẽ mất trạng thái khóa (clean session) và tự chạy lại. Retain đảm bảo device khóa lại ngay khi online.
+- Khi khóa: ESP32 ghi `*LOCK12345#` xuống STM32 (ưu tiên tuyệt đối, đè cả share/schedule/setting), gửi lại định kỳ mỗi ~3s để STM32 vừa reboot cũng khóa lại.
+- Khi mở khóa: ESP32 ghi một nhịp `*UNLOCK54321#` rồi trở lại giá trị bình thường (share > schedule > setting).
+
 ---
 
 ## OTA topic — KHÔNG dùng retain thông thường
@@ -56,6 +63,7 @@ mqttClient.publish("inverter/{uid}/{deviceId}/firmware/update", "", true);
 | `cmd/settings` | BE | ✅ true | idempotent, không cần clear |
 | `cmd/schedule` | BE | ✅ true | idempotent, không cần clear |
 | `share` | BE | ✅ true | device cần value mới nhất ngay khi online |
+| `blacklist` | BE | ✅ true | giữ trạng thái khóa qua reboot/reconnect; payload `{"lock":bool}` |
 | `firmware/update` | BE | ⚠️ true + phải clear sau khi device báo success | nguy hiểm nếu không clear |
 | `ota/status` | ESP32 | ❌ false | realtime progress, không cần retain |
 | `data` | ESP32 | ❌ false | realtime sensor data |

@@ -27,6 +27,7 @@ bool connectToMqtt() {
       MQTT_TOPIC_CMD_SETTINGS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/settings";
       MQTT_TOPIC_CMD_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/schedule";
       MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
+      MQTT_TOPIC_BLACKLIST    = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/blacklist";
 
       // Only subscribe to server->device control topics. Do NOT subscribe to
       // STATUS / DATA: the device publishes those itself, so subscribing echoes
@@ -38,6 +39,7 @@ bool connectToMqtt() {
       mqttClient.subscribe(MQTT_TOPIC_CMD_SETTINGS.c_str(), 1);  // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
+      mqttClient.subscribe(MQTT_TOPIC_BLACKLIST.c_str(), 1);     // QoS 1: lock must not be missed
 
       DBG_PRINT("Subscribed cmd/settings: [");
       DBG_PRINT(MQTT_TOPIC_CMD_SETTINGS);
@@ -91,6 +93,25 @@ void setupMqttCallback() {
         shareValue = doc["value"].as<int>();
         sharePending = true;
         shareAt = millis();
+      }
+    }
+    // Blacklist topic: payload is {"lock":true|false}. Server kill switch.
+    // Both this callback and applyCurrentValue() run on Core 1, so flipping the
+    // volatile flags here is safe without a mutex. The actual STM32 write stays
+    // in applyCurrentValue() (single-writer) — see logic.cpp.
+    else if (topicStr.endsWith("/blacklist")) {
+      JsonDocument doc;
+      if (deserializeJson(doc, message) == DeserializationError::Ok) {
+        bool lock = doc["lock"].as<bool>();
+        if (lock) {
+          deviceLocked = true;
+          unlockPending = false;      // a fresh lock cancels any queued unlock pulse
+        } else {
+          if (deviceLocked) unlockPending = true;  // emit one *UNLOCK54321# pulse
+          deviceLocked = false;
+        }
+        DBG_PRINT("[BLACKLIST] lock=");
+        DBG_PRINTLN(lock ? "true" : "false");
       }
     }
   });
