@@ -7,7 +7,7 @@ QueueHandle_t     jobQueue       = nullptr;
 QueueHandle_t     otaStatusQueue = nullptr;
 
 // ---- Peripherals / clients ------------------------------------------------
-EspSoftwareSerial::UART testSerial;
+HardwareSerial testSerial(2);   // UART2 for the STM32 link
 Preferences             preferences;
 WiFiClient              mqttWifiClient;
 PubSubClient            mqttClient(mqttWifiClient);
@@ -80,6 +80,8 @@ String       lastSetupValue = "";
 bool         scheduleActive = false;
 
 // ---- NTP / time config ----------------------------------------------------
-const char* ntpServer = "time.google.com";
+const char* ntpServer  = "time.google.com";
+const char* ntpServer2 = "pool.ntp.org";
+const char* ntpServer3 = "216.239.35.0";   // time.google.com IP: fallback if DNS is blocked
 const long  gmtOffset_sec = 0;
 const int   daylightOffset_sec = 0;

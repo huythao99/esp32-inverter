@@ -51,9 +51,6 @@ const long intervalSchedule = 60000;  // slow backstop poll; real-time via cmd/s
 const long intervalApply = 1000;      // re-evaluate the effective value every 1s
 const long intervalUpdateVersion = 30000;  // retry firmware-version report every 30s
 
-long double totalA = 0;
-long double totalA2 = 0;
-
 // Setup-page / connection control (Core 1 only)
 bool isStartRegisterDevice = false;
 bool isStartChangeModeWifi = false;
@@ -83,7 +80,8 @@ void setup() {
   DBG_PRINT("Firmware Version: ");
   DBG_PRINTLN(currentFirmwareVersion);
 
-  testSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, STM_RX, STM_TX);
+  testSerial.setRxBufferSize(512);   // must precede begin(); headroom for backlog
+  testSerial.begin(9600, SERIAL_8N1, STM_RX, STM_TX);
   DBG_PRINT("STM32 Serial: RX=");
   DBG_PRINT(STM_RX);
   DBG_PRINT(", TX=");
@@ -249,7 +247,7 @@ void loop() {
   if (wifiResetPending && currentMillis - wifiResetAt >= 1000) {
     wifiResetPending = false;
     WiFi.begin(param_ssid.c_str(), param_password.c_str());
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2, ntpServer3);
   }
 
   // Start a setup-page connection attempt.
@@ -285,7 +283,7 @@ void loop() {
   // Connect MQTT once WiFi is up.
   if (WiFi.status() == WL_CONNECTED && isStartMqtt) {
     sntp_set_time_sync_notification_cb(onNtpSync);
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2, ntpServer3);
     writeInfo(param_ssid, param_password, uid);
 
     if (connectToMqtt()) {
@@ -356,6 +354,27 @@ void loop() {
     trackLog("NTP_SYNCED", "Time synchronized successfully");
   }
 
+  // NTP diagnostic on USB serial (every 5s): sync flag, SNTP status, epoch, time.
+  static unsigned long previousMillisNtpDbg = 0;
+  if (currentMillis - previousMillisNtpDbg >= 5000) {
+    previousMillisNtpDbg = currentMillis;
+    sntp_sync_status_t st = sntp_get_sync_status();
+    const char* stStr = (st == SNTP_SYNC_STATUS_COMPLETED)   ? "COMPLETED"
+                      : (st == SNTP_SYNC_STATUS_IN_PROGRESS) ? "IN_PROGRESS"
+                                                             : "RESET";
+    time_t nowEpoch = time(nullptr);
+    struct tm ti;
+    char buf[20] = "----";
+    if (getLocalTime(&ti, 10)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+    DBG_PRINT("[NTP] synced=");  DBG_PRINT(isNtpSynced ? "1" : "0");
+    DBG_PRINT(" status=");       DBG_PRINT(stStr);
+    DBG_PRINT(" epoch=");        DBG_PRINT((long)nowEpoch);
+    DBG_PRINT(" time=");         DBG_PRINTLN(buf);
+    if (!isNtpSynced && nowEpoch < 1600000000) {
+      DBG_PRINTLN("[NTP] ERROR: clock not set - NTP not reached (check server/DNS/UDP123)");
+    }
+  }
+
   // Single writer to the STM32: share > schedule > setting, every 1s.
   if (currentMillis - previousMillisApply >= intervalApply) {
     previousMillisApply = currentMillis;
@@ -390,77 +409,57 @@ void loop() {
     WiFi.scanDelete();
   }
 
-  // Read STM32 data + publish over MQTT (every 3s).
+  // Drain the STM32 UART every loop so the RX buffer never backs up (works at
+  // any STM32 send cadence). Bytes accumulate across iterations until a
+  // terminator ('*', NUL, newline); the partial tail survives between loops, so
+  // a read landing mid-transmission never loses a frame's head. Each completed
+  // frame is validated (10 or 12 '#'-separated fields) and the newest valid one
+  // is kept for the next publish tick. No flush needed — the drain IS the flush.
+  static String latestStmFrame = "";   // most recent valid frame, awaiting publish
+  {
+    static String rxAccum = "";
+    while (testSerial.available()) {
+      char c = (char)testSerial.read();
+      if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
+        rxAccum.trim();
+        if (!rxAccum.isEmpty()) {
+          int startIndex = 0;
+          int tokenCount = 0;
+          while (startIndex < (int)rxAccum.length()) {
+            int endIndex = rxAccum.indexOf('#', startIndex);
+            if (endIndex == -1) endIndex = rxAccum.length();
+            tokenCount++;
+            startIndex = endIndex + 1;
+          }
+          if (tokenCount == 10 || tokenCount == 12) {
+            latestStmFrame = rxAccum;   // valid: keep as newest
+          } else {
+            DBG_PRINT("[STM32] drop frame, token count not 10/12: ");
+            DBG_PRINTLN(tokenCount);
+          }
+        }
+        rxAccum = "";
+      } else {
+        rxAccum += c;
+        if (rxAccum.length() > 256) rxAccum = "";   // runaway guard: terminator never arrived
+      }
+    }
+  }
+
+  // Publish the newest valid STM32 frame over MQTT (rate-limited to every 3s).
   if (currentMillis - previousMillis >= interval && isMqttConnected) {
     previousMillis = currentMillis;
-
-    DBG_PRINTLN("=== Reading STM32 Data ===");
-    int available = testSerial.available();
-    DBG_PRINT("Bytes available: ");
-    DBG_PRINTLN(available);
-
-    String res = testSerial.readString();
-    res.trim();
-
-    DBG_PRINT("Raw data: [");
-    DBG_PRINT(res);
-    DBG_PRINTLN("]");
-    DBG_PRINT("Length: ");
-    DBG_PRINTLN(res.length());
-
-    if (res.isEmpty()) {
-      DBG_PRINTLN("No data from STM32");
-      DBG_PRINTLN("=======================");
-    } else {
-      int indexOf = res.indexOf("*");
-      DBG_PRINT("Index of '*': ");
-      DBG_PRINTLN(indexOf);
-
-      res = res.substring(0, indexOf);
-      DBG_PRINT("Data after trim: ");
-      DBG_PRINTLN(res);
-
-      long double pAfter = 0;
-      long double p2After = 0;
-
-      int startIndex = 0;
-      int tokenCount = 0;
-      while (startIndex < (int)res.length()) {
-        int endIndex = res.indexOf('#', startIndex);
-        if (endIndex == -1) endIndex = res.length();
-
-        tokenCount++;
-        String token = res.substring(startIndex, endIndex);
-
-        if (tokenCount == 9) {
-          pAfter = fabs(token.toDouble());
-        } else if (tokenCount == 10) {
-          p2After = fabs(token.toDouble());
-          break;
-        }
-        startIndex = endIndex + 1;
-      }
-
-      totalA = totalA + pAfter / 1000000.0;
-      totalA2 = totalA2 + p2After / 1000000.0;
-
-      String jsonString = "{\"value\":\"" + res + "\",\"totalA2Capacity\":\"" + String((double)totalA2) + "\",\"totalACapacity\":\"" + String((double)totalA) + "\"}";
-
-      DBG_PRINTLN("=== Publishing to MQTT ===");
-      DBG_PRINT("Topic: ");
-      DBG_PRINTLN(MQTT_TOPIC_DATA);
-      DBG_PRINT("Payload: ");
-      DBG_PRINTLN(jsonString);
-
+    if (!latestStmFrame.isEmpty()) {
+      String jsonString = "{\"value\":\"" + latestStmFrame + "\"}";
       if (!MQTT_TOPIC_DATA.isEmpty()) {
         String signedJsonString = createSignedMessage(jsonString);
         bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
-        DBG_PRINT("Publish result: ");
+        DBG_PRINT("[STM32] publish ");
+        DBG_PRINT(jsonString);
+        DBG_PRINT(" -> ");
         DBG_PRINTLN(dataPublished ? "SUCCESS" : "FAILED");
-      } else {
-        DBG_PRINTLN("MQTT_TOPIC_DATA is empty!");
       }
-      DBG_PRINTLN("=======================");
+      latestStmFrame = "";   // clear so only fresh frames get published
     }
   }
 

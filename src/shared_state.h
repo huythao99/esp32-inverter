@@ -4,7 +4,6 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
-#include <SoftwareSerial.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -62,7 +61,7 @@ extern QueueHandle_t     jobQueue;
 extern QueueHandle_t     otaStatusQueue;
 
 // ---- Peripherals / clients ------------------------------------------------
-extern EspSoftwareSerial::UART testSerial;
+extern HardwareSerial          testSerial;   // UART2, STM32 link
 extern Preferences             preferences;
 extern WiFiClient              mqttWifiClient;
 extern PubSubClient            mqttClient;
@@ -140,5 +139,7 @@ extern bool         scheduleActive;  // guarded by stateMutex
 
 // ---- NTP / time config ----------------------------------------------------
 extern const char* ntpServer;
+extern const char* ntpServer2;
+extern const char* ntpServer3;
 extern const long  gmtOffset_sec;
 extern const int   daylightOffset_sec;
