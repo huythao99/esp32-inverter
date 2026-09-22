@@ -431,6 +431,12 @@ void loop() {
             tokenCount++;
             startIndex = endIndex + 1;
           }
+          // Raw dump: exact frame content, field count, len, and the terminator
+          // byte (hex) that ended it — use this to spot stray '#'/garbage fields.
+          DBG_PRINT("[STM32] frame=[");  DBG_PRINT(rxAccum);
+          DBG_PRINT("] tokens=");        DBG_PRINT(tokenCount);
+          DBG_PRINT(" len=");            DBG_PRINT(rxAccum.length());
+          DBG_PRINT(" term=0x");         DBG_PRINTLN((int)(uint8_t)c, HEX);
           if (tokenCount == 10 || tokenCount == 12) {
             latestStmFrame = rxAccum;   // valid: keep as newest
           } else {
