@@ -83,7 +83,7 @@ void setup() {
   DBG_PRINT("Firmware Version: ");
   DBG_PRINTLN(currentFirmwareVersion);
 
-  testSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, STM_RX, STM_TX);
+  testSerial.begin(9600, SERIAL_8N1, STM_RX, STM_TX);
   DBG_PRINT("STM32 Serial: RX=");
   DBG_PRINT(STM_RX);
   DBG_PRINT(", TX=");

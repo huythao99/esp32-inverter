@@ -4,7 +4,6 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
-#include <SoftwareSerial.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -62,7 +61,7 @@ extern QueueHandle_t     jobQueue;
 extern QueueHandle_t     otaStatusQueue;
 
 // ---- Peripherals / clients ------------------------------------------------
-extern EspSoftwareSerial::UART testSerial;
+extern HardwareSerial          testSerial;
 extern Preferences             preferences;
 extern WiFiClient              mqttWifiClient;
 extern PubSubClient            mqttClient;

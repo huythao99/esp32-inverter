@@ -7,7 +7,7 @@ QueueHandle_t     jobQueue       = nullptr;
 QueueHandle_t     otaStatusQueue = nullptr;
 
 // ---- Peripherals / clients ------------------------------------------------
-EspSoftwareSerial::UART testSerial;
+HardwareSerial          testSerial(2);  // ESP32 UART2 (Serial for USB debug uses UART0)
 Preferences             preferences;
 WiFiClient              mqttWifiClient;
 PubSubClient            mqttClient(mqttWifiClient);
