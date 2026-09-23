@@ -23,6 +23,7 @@ String MQTT_TOPIC_CMD_SETTINGS;
 String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
 String MQTT_TOPIC_BLACKLIST;
+String MQTT_TOPIC_CMD_RESTART;
 
 // ---- Command sync flags ---------------------------------------------------
 volatile bool cmdSettingsPending = false;
@@ -44,6 +45,11 @@ const long    shareDebounceMs = 100;
 
 // ---- OTA trigger ----------------------------------------------------------
 volatile bool otaPending = false;
+volatile bool otaInProgress = false;
+
+// ---- Remote restart -------------------------------------------------------
+volatile bool restartPending = false;
+unsigned long restartAt = 0;
 
 // ---- Blacklist / device lock ----------------------------------------------
 volatile bool deviceLocked  = false;

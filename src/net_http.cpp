@@ -8,9 +8,34 @@
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include "time.h"
+#include <sys/time.h>
 
 // Shared HTTPClient — Core 0 only.
 static HTTPClient http;
+
+// Response headers we want HTTPClient to keep. `Date` is the fallback clock
+// source when NTP (UDP 123) is blocked by the router/ISP.
+static const char* kCollectHeaders[] = {"Date"};
+
+// http.begin() + ask HTTPClient to keep the Date header of the response.
+static void beginJson(const String& url) {
+  http.begin(url);
+  http.collectHeaders(kCollectHeaders, 1);
+  http.addHeader("Content-Type", "application/json");
+}
+
+// If the clock is still unset (NTP not reached yet), set it from the server's
+// HTTP Date header. Second-level accuracy is plenty for minute-based schedules;
+// SNTP overwrites it with the precise time as soon as it gets through.
+static void syncClockFromHttpDate() {
+  if (isTimeValid()) return;
+  time_t t = parseHttpDate(http.header("Date"));
+  if (t <= 0) return;
+  struct timeval tv = { t, 0 };
+  settimeofday(&tv, nullptr);
+  DBG_PRINT("[TIME] clock set from HTTP Date: ");
+  DBG_PRINTLN((long)t);
+}
 
 void netHttpInit() {
   // Don't reuse HTTPS connections: polls are ~60s apart, so the server closes the
@@ -28,8 +53,7 @@ bool trackLogError(const String& errorCode, const String& errorMessage) {
   String currentUid = getUid();
   String url = String(API_BASE) + "/api/track-log-error";
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  beginJson(url);
 
   String jsonPayload = "{";
   jsonPayload += "\"userId\":\"" + jsonEscape(currentUid) + "\",";
@@ -39,6 +63,7 @@ bool trackLogError(const String& errorCode, const String& errorMessage) {
   jsonPayload += "}";
 
   int httpResponseCode = http.POST(jsonPayload);
+  syncClockFromHttpDate();
   bool success = (httpResponseCode == 200 || httpResponseCode == 201);
 
   DBG_PRINT("Track error log [");
@@ -107,11 +132,11 @@ bool updateFirmwareVersion(const String& firmwareVersion) {
 
   String url = String(API_BASE) + "/api/inverter-device/data/" + currentUid + "/" + wifiBroadcastSSID + "/firmware";
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  beginJson(url);
 
   String jsonPayload = "{\"firmwareVersion\":\"" + firmwareVersion + "\"}";
   int httpResponseCode = http.sendRequest("PATCH", jsonPayload);
+  syncClockFromHttpDate();
   bool success = false;
   if (httpResponseCode > 0) {
     http.getString();
@@ -130,10 +155,10 @@ String getFirmwareS3URL(const String& version) {
   String url = String(API_BASE) + "/api/firmware";
   url += "?deviceId=" + wifiBroadcastSSID;
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  beginJson(url);
 
   int httpResponseCode = http.GET();
+  syncClockFromHttpDate();
   String s3URL = "";
   if (httpResponseCode > 0) {
     String response = http.getString();
@@ -259,10 +284,10 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
 
   String url = String(API_BASE) + "/api/inverter-setting/data/" + deviceUid + "/" + deviceSSID + "?source=hardware";
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  beginJson(url);
 
   int httpResponseCode = http.GET();
+  syncClockFromHttpDate();
   String response = "";
 
   DBG_PRINT("[SETTING] HTTP code: ");
@@ -320,10 +345,10 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID) {
 
   String url = String(API_BASE) + "/api/inverter-schedule/data/" + deviceUid + "/" + deviceSSID + "?source=hardware";
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  beginJson(url);
 
   int httpResponseCode = http.GET();
+  syncClockFromHttpDate();
   String response = "";
 
   if (httpResponseCode > 0) {
@@ -357,8 +382,7 @@ bool registerDevice(const String& deviceId, const String& deviceName, const Stri
 
   String url = String(API_BASE) + "/api/inverter-device/data";
 
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
+  beginJson(url);
 
   String jsonPayload = "{";
   jsonPayload += "\"deviceId\":\"" + deviceId + "\",";
@@ -368,6 +392,7 @@ bool registerDevice(const String& deviceId, const String& deviceName, const Stri
   jsonPayload += "}";
 
   int httpResponseCode = http.POST(jsonPayload);
+  syncClockFromHttpDate();
   bool success = false;
   if (httpResponseCode > 0) {
     http.getString();

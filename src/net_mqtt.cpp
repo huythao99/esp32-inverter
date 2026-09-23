@@ -3,6 +3,7 @@
 #include "config.h"
 #include "storage.h"
 #include "worker.h"
+#include "logic.h"
 #include <ArduinoJson.h>
 #include "time.h"
 
@@ -28,6 +29,7 @@ bool connectToMqtt() {
       MQTT_TOPIC_CMD_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/schedule";
       MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
       MQTT_TOPIC_BLACKLIST    = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/blacklist";
+      MQTT_TOPIC_CMD_RESTART  = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/restart";
 
       // Only subscribe to server->device control topics. Do NOT subscribe to
       // STATUS / DATA: the device publishes those itself, so subscribing echoes
@@ -40,6 +42,7 @@ bool connectToMqtt() {
       mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_BLACKLIST.c_str(), 1);     // QoS 1: lock must not be missed
+      mqttClient.subscribe(MQTT_TOPIC_CMD_RESTART.c_str(), 1);   // QoS 1, never retained
 
       DBG_PRINT("Subscribed cmd/settings: [");
       DBG_PRINT(MQTT_TOPIC_CMD_SETTINGS);
@@ -85,6 +88,30 @@ void setupMqttCallback() {
     else if (topicStr.endsWith("/cmd/schedule")) {
       cmdSchedulePending = true;
       cmdScheduleAt = millis();
+    }
+    // Remote restart: payload {"requestId":"...","source":"app","ts":<epoch ms>}.
+    // Guards against reboot loops if a restart message is ever redelivered or
+    // retained by mistake:
+    //  - ignored during the first 20s after boot,
+    //  - ignored when older than 2 minutes (only checkable once the clock is set).
+    // The reboot itself happens in loop() after a short delay (see main.cpp).
+    else if (topicStr.endsWith("/cmd/restart")) {
+      bool accept = millis() > 20000UL;
+      if (accept && isTimeValid()) {
+        JsonDocument doc;
+        if (deserializeJson(doc, message) == DeserializationError::Ok &&
+            doc["ts"].is<double>()) {
+          double nowMs = (double)time(nullptr) * 1000.0;
+          double ageMs = nowMs - doc["ts"].as<double>();
+          if (ageMs > 120000.0) accept = false;
+        }
+      }
+      if (accept && !restartPending) {
+        restartPending = true;
+        restartAt = millis();
+      }
+      DBG_PRINT("[RESTART] command ");
+      DBG_PRINTLN(accept ? "accepted" : "ignored (stale / just booted)");
     }
     // Share topic: payload is {"value":N}. Parse now, apply from loop().
     else if (topicStr.endsWith("/share")) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <time.h>
 
 // ---------------------------------------------------------------------------
 // Pure decision logic + the single STM32 writer.
@@ -35,3 +36,12 @@ String createSignedMessage(const String& payload);
 
 // SNTP sync callback (sets isNtpSynced).
 void onNtpSync(struct timeval* tv);
+
+// True once the system clock holds a real date — set either by SNTP or by the
+// HTTP `Date` header fallback. Use this (not isNtpSynced) to decide whether
+// time-based logic such as schedules may run.
+bool isTimeValid();
+
+// Parse an HTTP `Date` header (RFC 7231, e.g. "Wed, 23 Sep 2026 08:12:34 GMT")
+// into UTC epoch seconds. Returns 0 if it cannot be parsed.
+time_t parseHttpDate(const String& s);

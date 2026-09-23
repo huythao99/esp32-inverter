@@ -77,6 +77,7 @@ extern String MQTT_TOPIC_CMD_SETTINGS;
 extern String MQTT_TOPIC_CMD_SCHEDULE;
 extern String MQTT_TOPIC_SHARE;
 extern String MQTT_TOPIC_BLACKLIST;
+extern String MQTT_TOPIC_CMD_RESTART;
 
 // ---- Command sync flags (set in MQTT callback, drained in loop) -----------
 extern volatile bool  cmdSettingsPending;
@@ -97,6 +98,11 @@ extern const long     shareDebounceMs;  // own debounce (not cmdDebounce): small
 
 // ---- OTA trigger (set in MQTT callback) -----------------------------------
 extern volatile bool  otaPending;
+extern volatile bool  otaInProgress;   // set by the Core 0 worker while an OTA job runs
+
+// ---- Remote restart (set in MQTT callback, executed in loop) --------------
+extern volatile bool  restartPending;
+extern unsigned long  restartAt;
 
 // ---- Blacklist / device lock (server kill switch) -------------------------
 // Both written by the MQTT callback and read by applyCurrentValue(); both run

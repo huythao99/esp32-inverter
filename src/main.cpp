@@ -4,6 +4,7 @@
 #include "time.h"
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
+#include "esp_system.h"
 #include <math.h>
 
 #include "config.h"
@@ -67,6 +68,21 @@ bool scanRequested = false;
 int wifiConnectResult = -1;
 unsigned long connectAttemptStart = 0;
 const long connectTimeout = 15000;
+
+// Delay between receiving cmd/restart and actually rebooting.
+static const unsigned long kRestartDelayMs = 1500;
+
+// SNTP state (Core 1 only).
+static bool          ntpStarted = false;
+static unsigned long ntpStartedAt = 0;
+static const unsigned long kNtpRetryMs = 60000;
+
+static void startNtp(unsigned long now) {
+  sntp_set_time_sync_notification_cb(onNtpSync);
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2, ntpServer3);
+  ntpStarted = true;
+  ntpStartedAt = now;
+}
 
 // ---- Small helpers for the web routes -------------------------------------
 static String connectSuccess() { return "success"; }
@@ -231,6 +247,20 @@ void loop() {
     requestOTA();
   }
 
+  // Remote restart requested over MQTT (cmd/restart). Wait a moment so the
+  // QoS 1 PUBACK actually leaves the socket (no redelivery after boot), and
+  // never reboot in the middle of an OTA flash. The STM32 keeps running on its
+  // last value meanwhile; applyCurrentValue() re-sends it after boot.
+  if (restartPending && !otaPending && !otaInProgress &&
+      currentMillis - restartAt >= kRestartDelayMs) {
+    restartPending = false;
+    // No "restarting" status publish: apps treat any status message as
+    // "online" and would briefly show the device online while it reboots.
+    mqttClient.disconnect();
+    delay(200);   // let the TCP stack flush the disconnect
+    ESP.restart();
+  }
+
   // WiFi AP mode toggle (user-initiated, rare). Kept blocking: it only runs on
   // an explicit /change-mode-wifi request.
   if (isStartChangeModeWifi) {
@@ -247,7 +277,17 @@ void loop() {
   if (wifiResetPending && currentMillis - wifiResetAt >= 1000) {
     wifiResetPending = false;
     WiFi.begin(param_ssid.c_str(), param_password.c_str());
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2, ntpServer3);
+  }
+
+  // NTP: start SNTP once WiFi is up, then leave it running (it re-syncs by
+  // itself every hour). While the clock is STILL unset, restart it every
+  // kNtpRetryMs: after failed attempts lwIP backs off exponentially, and at
+  // boot the first request often fails because DNS is not ready yet.
+  // (Previously configTime() ran on every loop pass while MQTT kept failing,
+  // which aborted each in-flight NTP request so the clock never got set.)
+  if (WiFi.status() == WL_CONNECTED &&
+      (!ntpStarted || (!isTimeValid() && currentMillis - ntpStartedAt >= kNtpRetryMs))) {
+    startNtp(currentMillis);
   }
 
   // Start a setup-page connection attempt.
@@ -282,8 +322,6 @@ void loop() {
 
   // Connect MQTT once WiFi is up.
   if (WiFi.status() == WL_CONNECTED && isStartMqtt) {
-    sntp_set_time_sync_notification_cb(onNtpSync);
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2, ntpServer3);
     writeInfo(param_ssid, param_password, uid);
 
     if (connectToMqtt()) {
@@ -347,6 +385,15 @@ void loop() {
     previousMillisApply = currentMillis;
   }
 
+  // Report why the device (re)booted, once it is online, so a remote restart
+  // (or a crash / watchdog reset) is visible in the backend error log.
+  static bool bootReasonLogged = false;
+  if (!bootReasonLogged && isMqttConnected) {
+    bootReasonLogged = true;
+    trackLog("BOOT", "reset_reason=" + String((int)esp_reset_reason()) +
+                     " fw=" + currentFirmwareVersion);
+  }
+
   // Log NTP sync from loop() (safe) rather than the SNTP callback.
   static bool ntpSyncLogged = false;
   if (isNtpSynced && !ntpSyncLogged) {
@@ -354,7 +401,17 @@ void loop() {
     trackLog("NTP_SYNCED", "Time synchronized successfully");
   }
 
+  // Clock set by the HTTP Date fallback while NTP is still unreachable: report
+  // once so the backend can see which devices have UDP 123 blocked.
+  static bool httpTimeLogged = false;
+  if (!isNtpSynced && !httpTimeLogged && isTimeValid()) {
+    httpTimeLogged = true;
+    trackLog("TIME_FROM_HTTP", "Clock set from HTTP Date header (NTP not reachable yet)");
+  }
+
+#if DEBUG
   // NTP diagnostic on USB serial (every 5s): sync flag, SNTP status, epoch, time.
+  // Only in DEBUG builds: sntp_get_sync_status() consumes the COMPLETED state.
   static unsigned long previousMillisNtpDbg = 0;
   if (currentMillis - previousMillisNtpDbg >= 5000) {
     previousMillisNtpDbg = currentMillis;
@@ -374,6 +431,7 @@ void loop() {
       DBG_PRINTLN("[NTP] ERROR: clock not set - NTP not reached (check server/DNS/UDP123)");
     }
   }
+#endif
 
   // Single writer to the STM32: share > schedule > setting, every 1s.
   if (currentMillis - previousMillisApply >= intervalApply) {
@@ -477,20 +535,26 @@ void loop() {
     connectMqtt = 0;
   }
 
-  // Periodic online status publish.
+  // Periodic online status publish (heartbeat, every intervalMqtt).
+  // ALWAYS published, even before the clock is set: apps use this message as
+  // the online signal, so gating it on NTP made devices look offline whenever
+  // NTP was unreachable. `updatedAt` is only included once the clock is valid;
+  // `uptime` (seconds since boot) is always there.
   if (currentMillis - previousMillisMqtt >= intervalMqtt) {
     previousMillisMqtt = currentMillis;
-    if (isMqttConnected && mqttClient.connected()) {
-      struct tm timeinfo;
-      if (getLocalTime(&timeinfo, 10)) {   // short timeout: never blocks the loop
-        char timeStringBuff[50];
-        strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-        if (!MQTT_TOPIC_STATUS.isEmpty()) {
-          String statusMsg = "{\"updatedAt\":\"" + String(timeStringBuff) + "\",\"status\":\"online\"}";
-          String signedStatusMsg = createSignedMessage(statusMsg);
-          mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
+    if (isMqttConnected && mqttClient.connected() && !MQTT_TOPIC_STATUS.isEmpty()) {
+      String statusMsg = "{";
+      if (isTimeValid()) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 10)) {   // short timeout: never blocks the loop
+          char timeStringBuff[32];
+          strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+          statusMsg += "\"updatedAt\":\"" + String(timeStringBuff) + "\",";
         }
       }
+      statusMsg += "\"status\":\"online\",\"uptime\":" + String(currentMillis / 1000) + "}";
+      String signedStatusMsg = createSignedMessage(statusMsg);
+      mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
     }
   }
 
