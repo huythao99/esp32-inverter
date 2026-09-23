@@ -69,6 +69,132 @@ int wifiConnectResult = -1;
 unsigned long connectAttemptStart = 0;
 const long connectTimeout = 15000;
 
+// ---------------------------------------------------------------------------
+// STM32 UART diagnostics
+//
+// Tells line/electrical problems apart from ESP32-side losses:
+//  - hardware errors reported by the UART driver (onReceiveError):
+//      FRAME / PARITY / BREAK  -> bit errors on the wire (noise, bad GND,
+//                                 baud mismatch, floating RX)
+//      FIFO_OVF / BUFFER_FULL  -> the ESP32 did not read fast enough
+//  - frames rejected by the parser (wrong field count, non-numeric field,
+//    non-printable byte, over-long line).
+// Counters are reported as deltas every kUartReportMs via trackLog
+// ("UART_STATS") together with one escaped sample of a rejected frame
+// ("STM32_BAD_FRAME"). Only sent when something went wrong.
+// ---------------------------------------------------------------------------
+enum UartCounter : uint8_t {
+  UC_OK = 0,        // valid frames accepted
+  UC_HW_FRAME,      // UART framing error (stop bit not found)
+  UC_HW_PARITY,     // parity error (8N1 -> should stay 0)
+  UC_HW_BREAK,      // line held low (disconnected / reset STM32)
+  UC_HW_FIFO_OVF,   // hardware FIFO overflow
+  UC_HW_BUF_FULL,   // RX ring buffer full (loop() blocked too long)
+  UC_DROP_HWERR,    // frames dropped because a HW error hit them
+  UC_BAD_FIELDS,    // field count not 10/12
+  UC_BAD_NUMBER,    // a field is not a plain number
+  UC_BAD_CHAR,      // frame contained a non-printable byte
+  UC_TOO_LONG,      // no terminator within 256 bytes
+  UC_COUNT
+};
+static volatile uint32_t s_uartCounters[UC_COUNT] = {0};
+static portMUX_TYPE     s_uartMux = portMUX_INITIALIZER_UNLOCKED;
+// Set by the UART error callback: the frame being assembled is corrupt.
+static volatile bool    s_uartErrorInFrame = false;
+static String           s_lastBadFrame;        // escaped sample, Core 1 only
+static unsigned long    s_lastUartReport = 0;
+static const unsigned long kUartReportMs = 300000;   // 5 min
+
+static inline void uartCount(UartCounter c) {
+  portENTER_CRITICAL(&s_uartMux);
+  s_uartCounters[c]++;
+  portEXIT_CRITICAL(&s_uartMux);
+}
+
+// Runs on the UART event task (not Core 1's loop) — keep it tiny.
+static void onStmUartError(hardwareSerial_error_t err) {
+  switch (err) {
+    case UART_FRAME_ERROR:       uartCount(UC_HW_FRAME);    break;
+    case UART_PARITY_ERROR:      uartCount(UC_HW_PARITY);   break;
+    case UART_BREAK_ERROR:       uartCount(UC_HW_BREAK);    break;
+    case UART_FIFO_OVF_ERROR:    uartCount(UC_HW_FIFO_OVF); break;
+    case UART_BUFFER_FULL_ERROR: uartCount(UC_HW_BUF_FULL); break;
+    default: return;
+  }
+  s_uartErrorInFrame = true;
+}
+
+// Printable copy of a frame for the log: non-printable bytes as \xNN,
+// truncated so it fits the 100-byte trackLog message.
+static String escapeFrame(const String& in) {
+  String out;
+  out.reserve(80);
+  for (unsigned int i = 0; i < in.length() && out.length() < 72; i++) {
+    uint8_t b = (uint8_t)in[i];
+    if (b >= 0x20 && b <= 0x7E) {
+      out += (char)b;
+    } else {
+      char hex[5];
+      snprintf(hex, sizeof(hex), "\\x%02X", b);
+      out += hex;
+    }
+  }
+  if (in.length() > 0 && out.length() >= 72) out += "...";
+  return out;
+}
+
+// A field may be: optional leading '$' (first field only), optional sign,
+// digits with at most one '.'.
+static bool isNumericField(const String& f, bool first) {
+  unsigned int i = 0;
+  if (first && i < f.length() && f[i] == '$') i++;
+  if (i < f.length() && (f[i] == '-' || f[i] == '+')) i++;
+  bool digit = false, dot = false;
+  for (; i < f.length(); i++) {
+    char c = f[i];
+    if (c >= '0' && c <= '9') { digit = true; continue; }
+    if (c == '.' && !dot) { dot = true; continue; }
+    return false;
+  }
+  return digit;
+}
+
+static void rejectFrame(UartCounter reason, const String& frame) {
+  uartCount(reason);
+  s_lastBadFrame = escapeFrame(frame);
+}
+
+// Send the counters (as deltas) when anything went wrong in the last period.
+static void reportUartStats(unsigned long now) {
+  if (now - s_lastUartReport < kUartReportMs) return;
+  s_lastUartReport = now;
+
+  uint32_t c[UC_COUNT];
+  portENTER_CRITICAL(&s_uartMux);
+  for (int i = 0; i < UC_COUNT; i++) { c[i] = s_uartCounters[i]; s_uartCounters[i] = 0; }
+  portEXIT_CRITICAL(&s_uartMux);
+
+  uint32_t problems = 0;
+  for (int i = 1; i < UC_COUNT; i++) problems += c[i];
+  if (problems == 0) { s_lastBadFrame = ""; return; }
+
+  char msg[100];
+  snprintf(msg, sizeof(msg),
+           "ok=%lu fe=%lu pe=%lu brk=%lu ovf=%lu full=%lu drop=%lu fld=%lu num=%lu chr=%lu long=%lu",
+           (unsigned long)c[UC_OK], (unsigned long)c[UC_HW_FRAME], (unsigned long)c[UC_HW_PARITY],
+           (unsigned long)c[UC_HW_BREAK], (unsigned long)c[UC_HW_FIFO_OVF],
+           (unsigned long)c[UC_HW_BUF_FULL], (unsigned long)c[UC_DROP_HWERR],
+           (unsigned long)c[UC_BAD_FIELDS], (unsigned long)c[UC_BAD_NUMBER],
+           (unsigned long)c[UC_BAD_CHAR], (unsigned long)c[UC_TOO_LONG]);
+  trackLog("UART_STATS", String(msg), kUartReportMs - 1000);
+  DBG_PRINT("[UART] "); DBG_PRINTLN(msg);
+  if (!s_lastBadFrame.isEmpty()) {
+    trackLog("STM32_BAD_FRAME", s_lastBadFrame, kUartReportMs - 1000);
+    DBG_PRINT("[UART] bad frame sample: "); DBG_PRINTLN(s_lastBadFrame);
+    s_lastBadFrame = "";
+  }
+}
+
 // Delay between receiving cmd/restart and actually rebooting.
 static const unsigned long kRestartDelayMs = 1500;
 
@@ -98,6 +224,9 @@ void setup() {
 
   testSerial.setRxBufferSize(512);   // must precede begin(); headroom for backlog
   testSerial.begin(9600, SERIAL_8N1, STM_RX, STM_TX);
+  // Count hardware receive errors (framing/parity/break/overflow) so we can
+  // tell wire noise from ESP32-side losses. See "STM32 UART diagnostics".
+  testSerial.onReceiveError(onStmUartError);
   DBG_PRINT("STM32 Serial: RX=");
   DBG_PRINT(STM_RX);
   DBG_PRINT(", TX=");
@@ -476,16 +605,30 @@ void loop() {
   static String latestStmFrame = "";   // most recent valid frame, awaiting publish
   {
     static String rxAccum = "";
+    static bool   skipToTerminator = false;   // after an over-long line
+    static bool   frameHasBadChar = false;
     while (testSerial.available()) {
       char c = (char)testSerial.read();
       if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
+        // A HW receive error (bit error / overflow) happened while this frame
+        // was on the wire: its content can't be trusted.
+        bool hwError = s_uartErrorInFrame;
+        s_uartErrorInFrame = false;
         rxAccum.trim();
-        if (!rxAccum.isEmpty()) {
+        if (skipToTerminator) {
+          skipToTerminator = false;         // end of the over-long garbage
+        } else if (!rxAccum.isEmpty()) {
+          // Split into '#'-separated fields and validate each one.
           int startIndex = 0;
           int tokenCount = 0;
+          bool allNumeric = true;
           while (startIndex < (int)rxAccum.length()) {
             int endIndex = rxAccum.indexOf('#', startIndex);
             if (endIndex == -1) endIndex = rxAccum.length();
+            if (allNumeric &&
+                !isNumericField(rxAccum.substring(startIndex, endIndex), tokenCount == 0)) {
+              allNumeric = false;
+            }
             tokenCount++;
             startIndex = endIndex + 1;
           }
@@ -495,20 +638,39 @@ void loop() {
           DBG_PRINT("] tokens=");        DBG_PRINT(tokenCount);
           DBG_PRINT(" len=");            DBG_PRINT(rxAccum.length());
           DBG_PRINT(" term=0x");         DBG_PRINTLN((int)(uint8_t)c, HEX);
-          if (tokenCount == 10 || tokenCount == 12) {
-            latestStmFrame = rxAccum;   // valid: keep as newest
+
+          if (hwError) {
+            rejectFrame(UC_DROP_HWERR, rxAccum);
+          } else if (frameHasBadChar) {
+            rejectFrame(UC_BAD_CHAR, rxAccum);
+          } else if (tokenCount != 10 && tokenCount != 12) {
+            rejectFrame(UC_BAD_FIELDS, rxAccum);
           } else {
-            DBG_PRINT("[STM32] drop frame, token count not 10/12: ");
-            DBG_PRINTLN(tokenCount);
+            // Non-numeric fields are only COUNTED for now (diagnostics); the
+            // frame is still forwarded as before.
+            if (!allNumeric) rejectFrame(UC_BAD_NUMBER, rxAccum);
+            else uartCount(UC_OK);
+            latestStmFrame = rxAccum;   // keep as newest
           }
         }
         rxAccum = "";
-      } else {
+        frameHasBadChar = false;
+      } else if (!skipToTerminator) {
+        uint8_t b = (uint8_t)c;
+        if (b < 0x20 || b > 0x7E) frameHasBadChar = true;
         rxAccum += c;
-        if (rxAccum.length() > 256) rxAccum = "";   // runaway guard: terminator never arrived
+        if (rxAccum.length() > 256) {
+          // Terminator never arrived: drop this line AND everything up to the
+          // next terminator (its tail would otherwise look like a new frame).
+          rejectFrame(UC_TOO_LONG, rxAccum);
+          rxAccum = "";
+          frameHasBadChar = false;
+          skipToTerminator = true;
+        }
       }
     }
   }
+  reportUartStats(currentMillis);
 
   // Publish the newest valid STM32 frame over MQTT (rate-limited to every 3s).
   if (currentMillis - previousMillis >= interval && isMqttConnected) {
