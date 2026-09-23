@@ -95,6 +95,34 @@ String loadSettingFromStorage() {
   return value;
 }
 
+// Last schedule written to / read from NVS, to skip identical writes: the
+// schedule is re-fetched every 60 s but rarely changes.
+static String s_storedSchedule;
+static bool   s_storedScheduleKnown = false;
+static const unsigned int kMaxStoredScheduleLen = 1900;  // NVS string limit is ~4000
+
+void saveScheduleToStorage(const String& schedule) {
+  String value = schedule;
+  if (value == "null") value = "";          // server has no schedule for us
+  if (value.length() > kMaxStoredScheduleLen) return;
+  if (s_storedScheduleKnown && value == s_storedSchedule) return;
+
+  preferences.begin("device_setting", false);
+  preferences.putString("schedule", value);
+  preferences.end();
+  s_storedSchedule = value;
+  s_storedScheduleKnown = true;
+}
+
+String loadScheduleFromStorage() {
+  preferences.begin("device_setting", true);
+  String value = preferences.getString("schedule", "");
+  preferences.end();
+  s_storedSchedule = value;
+  s_storedScheduleKnown = true;
+  return value;
+}
+
 void saveWifiBroadcastSSID(const String& ssid) {
   preferences.begin("wifi_config", false);
   preferences.putString("broadcast_ssid", ssid);

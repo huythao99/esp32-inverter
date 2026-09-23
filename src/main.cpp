@@ -266,6 +266,18 @@ void setup() {
     DBG_PRINTLN(lastSetupValue);
   }
 
+  // Last known schedule from NVS: runs until the first successful fetch, so a
+  // reboot while the server is unreachable doesn't drop the schedule.
+  // (Before workerInit(): no other task touches schedules[] yet.)
+  {
+    String storedSchedule = loadScheduleFromStorage();
+    if (!storedSchedule.isEmpty()) {
+      parseScheduleData(storedSchedule);
+      DBG_PRINT("Loaded schedule from storage, count=");
+      DBG_PRINTLN(scheduleCount);
+    }
+  }
+
   netHttpInit();
 
   // MQTT init

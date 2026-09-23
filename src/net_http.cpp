@@ -362,6 +362,9 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID) {
         parseScheduleData(value);
         int count = scheduleCount;
         xSemaphoreGive(stateMutex);
+        // Persist (outside the lock, NVS write) so a reboot while the server
+        // is unreachable still runs the last known schedule.
+        saveScheduleToStorage(value);
         DBG_PRINT("[SCHEDULE] loaded, count="); DBG_PRINTLN(count);
       } else {
         trackLogRL("SCHEDULE_JSON_ERR", "JSON parse failed: " + String(error.c_str()));
