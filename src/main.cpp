@@ -43,7 +43,7 @@ unsigned long previousMillisMqttReconnect = 0;
 unsigned long previousMillisApply = 0;
 unsigned long previousMillisUpdateVersion = 0;
 
-const long interval = 3000;
+const long interval = 1000;  // read STM32 frame + publish every 1s
 const long intervalWifi = 60000;
 const long intervalMqtt = 1000;
 const long intervalMqttReconnect = 10000;
@@ -51,6 +51,14 @@ const long invertalSetting = 60000;   // slow backstop poll; real-time via cmd/s
 const long intervalSchedule = 60000;  // slow backstop poll; real-time via cmd/schedule MQTT
 const long intervalApply = 1000;      // re-evaluate the effective value every 1s
 const long intervalUpdateVersion = 30000;  // retry firmware-version report every 30s
+
+// STM32 hardware-serial framing. The UART is drained byte-by-byte every loop()
+// iteration so no message is ever missed; '*' terminates a frame. stmMsgBuffer
+// holds the in-progress frame, stmLatestFrame the most recent complete one that
+// the 1s publish tick will consume.
+static String stmMsgBuffer;
+static String stmLatestFrame;
+static const int STM_FRAME_MAX = 512;  // overflow guard for a runaway/garbled stream
 
 // Setup-page / connection control (Core 1 only)
 bool isStartRegisterDevice = false;
@@ -77,8 +85,8 @@ const long connectTimeout = 15000;
 //      FRAME / PARITY / BREAK  -> bit errors on the wire (noise, bad GND,
 //                                 baud mismatch, floating RX)
 //      FIFO_OVF / BUFFER_FULL  -> the ESP32 did not read fast enough
-//  - frames rejected by the parser (wrong field count, non-numeric field,
-//    non-printable byte, over-long line).
+//  - frames rejected by acceptFrame() (wrong field count, non-numeric field,
+//    non-printable byte, over-long line). Rejected frames are NOT published.
 // Counters are reported as deltas every kUartReportMs via trackLog
 // ("UART_STATS") together with one escaped sample of a rejected frame
 // ("STM32_BAD_FRAME"). Only sent when something went wrong.
@@ -90,7 +98,7 @@ enum UartCounter : uint8_t {
   UC_HW_BREAK,      // line held low (disconnected / reset STM32)
   UC_HW_FIFO_OVF,   // hardware FIFO overflow
   UC_HW_BUF_FULL,   // RX ring buffer full (loop() blocked too long)
-  UC_DROP_HWERR,    // frames dropped because a HW error hit them
+  UC_DROP_HWERR,    // frames dropped: HW error / RX overflow hit them
   UC_BAD_FIELDS,    // field count not 10/12
   UC_BAD_NUMBER,    // a field is not a plain number
   UC_BAD_CHAR,      // frame contained a non-printable byte
@@ -101,6 +109,9 @@ static volatile uint32_t s_uartCounters[UC_COUNT] = {0};
 static portMUX_TYPE     s_uartMux = portMUX_INITIALIZER_UNLOCKED;
 // Set by the UART error callback: the frame being assembled is corrupt.
 static volatile bool    s_uartErrorInFrame = false;
+// Set on RX overflow (HW FIFO / ring buffer full): bytes were lost somewhere
+// in what is buffered right now, so the whole backlog can't be trusted.
+static volatile bool    s_uartOverflow = false;
 static String           s_lastBadFrame;        // escaped sample, Core 1 only
 static unsigned long    s_lastUartReport = 0;
 static const unsigned long kUartReportMs = 300000;   // 5 min
@@ -117,8 +128,8 @@ static void onStmUartError(hardwareSerial_error_t err) {
     case UART_FRAME_ERROR:       uartCount(UC_HW_FRAME);    break;
     case UART_PARITY_ERROR:      uartCount(UC_HW_PARITY);   break;
     case UART_BREAK_ERROR:       uartCount(UC_HW_BREAK);    break;
-    case UART_FIFO_OVF_ERROR:    uartCount(UC_HW_FIFO_OVF); break;
-    case UART_BUFFER_FULL_ERROR: uartCount(UC_HW_BUF_FULL); break;
+    case UART_FIFO_OVF_ERROR:    uartCount(UC_HW_FIFO_OVF); s_uartOverflow = true; break;
+    case UART_BUFFER_FULL_ERROR: uartCount(UC_HW_BUF_FULL); s_uartOverflow = true; break;
     default: return;
   }
   s_uartErrorInFrame = true;
@@ -162,6 +173,102 @@ static bool isNumericField(const String& f, bool first) {
 static void rejectFrame(UartCounter reason, const String& frame) {
   uartCount(reason);
   s_lastBadFrame = escapeFrame(frame);
+}
+
+// Field count this STM32 sends (10 or 12), learned from the first valid frame
+// after boot. A frame whose head was lost can still split into exactly 10
+// fields (a 12-field frame minus its first two), so once the count is known a
+// different count is rejected — unless it repeats kFieldRelearnRun times in a
+// row (the STM32 firmware really changed).
+static int s_expectedFields = 0;       // 0 = not learned yet
+static int s_otherFields = 0;
+static int s_otherFieldsRun = 0;
+static const int kFieldRelearnRun = 5;
+
+// Validate a completed (trimmed) frame. Returns true when it may be published.
+// Rejected frames are counted for UART_STATS and one escaped sample is kept
+// for STM32_BAD_FRAME. A frame that passes here contains only digits, '.',
+// '+', '-', '#' and an optional leading '$', so it is also JSON-safe.
+static bool acceptFrame(const String& frame, bool hwError) {
+  if (hwError) { rejectFrame(UC_DROP_HWERR, frame); return false; }
+
+  int fields = 0;
+  bool allNumeric = true;
+  bool badChar = false;
+  const int len = frame.length();
+  for (int i = 0; i < len; i++) {
+    uint8_t b = (uint8_t)frame[i];
+    if (b < 0x20 || b > 0x7E) { badChar = true; break; }
+  }
+  // Same field split the backend uses; a trailing '#' adds no empty field.
+  int start = 0;
+  while (start < len) {
+    int end = frame.indexOf('#', start);
+    if (end == -1) end = len;
+    if (allNumeric && !isNumericField(frame.substring(start, end), fields == 0)) {
+      allNumeric = false;
+    }
+    fields++;
+    start = end + 1;
+  }
+
+  if (badChar)                           { rejectFrame(UC_BAD_CHAR, frame);   return false; }
+  if (fields != 10 && fields != 12)      { rejectFrame(UC_BAD_FIELDS, frame); return false; }
+  if (!allNumeric)                       { rejectFrame(UC_BAD_NUMBER, frame); return false; }
+
+  if (s_expectedFields == 0 || fields == s_expectedFields) {
+    s_expectedFields = fields;
+    s_otherFieldsRun = 0;
+  } else {
+    s_otherFieldsRun = (fields == s_otherFields) ? s_otherFieldsRun + 1 : 1;
+    s_otherFields = fields;
+    if (s_otherFieldsRun < kFieldRelearnRun) {
+      rejectFrame(UC_BAD_FIELDS, frame);
+      return false;
+    }
+    s_expectedFields = fields;           // consistent new format: adopt it
+    s_otherFieldsRun = 0;
+  }
+  uartCount(UC_OK);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Memory diagnostics: heap + task stack high-water marks, sent every
+// kMemReportMs as "STACK_STATS" (and once ~2 min after boot). Used to size the
+// task stacks safely (async_tcp via CONFIG_ASYNC_TCP_STACK_SIZE, http_worker in
+// workerInit()). Values: bytes; stack = minimum free stack ever seen (-1 if the
+// task doesn't exist yet).
+// ---------------------------------------------------------------------------
+static unsigned long s_lastMemReport = 0;
+static bool          s_firstMemReportDone = false;
+static const unsigned long kMemReportMs = 1800000;     // 30 min
+static const unsigned long kFirstMemReportMs = 120000; // 2 min after boot
+
+static long stackFreeBytes(const char* taskName) {
+  TaskHandle_t h = xTaskGetHandle(taskName);
+  if (h == nullptr) return -1;
+  return (long)uxTaskGetStackHighWaterMark(h);   // ESP-IDF: in bytes
+}
+
+static void reportMemStats(unsigned long now) {
+  if (!s_firstMemReportDone) {
+    if (now < kFirstMemReportMs) return;
+    s_firstMemReportDone = true;
+  } else if (now - s_lastMemReport < kMemReportMs) {
+    return;
+  }
+  s_lastMemReport = now;
+
+  char msg[100];
+  snprintf(msg, sizeof(msg),
+           "heap=%u min=%u blk=%u loop=%ld worker=%ld async=%ld",
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+           (unsigned)ESP.getMaxAllocHeap(),
+           (long)uxTaskGetStackHighWaterMark(nullptr),   // this (loop) task
+           stackFreeBytes("http_worker"), stackFreeBytes("async_tcp"));
+  trackLog("STACK_STATS", String(msg), kMemReportMs - 1000);
+  DBG_PRINT("[MEM] "); DBG_PRINTLN(msg);
 }
 
 // Send the counters (as deltas) when anything went wrong in the last period.
@@ -222,7 +329,14 @@ void setup() {
   DBG_PRINT("Firmware Version: ");
   DBG_PRINTLN(currentFirmwareVersion);
 
-  testSerial.setRxBufferSize(512);   // must precede begin(); headroom for backlog
+  // Hardware UART2 for the STM32 link. Enlarge the RX FIFO/ring buffer so bytes
+  // are never dropped even if loop() is briefly busy between drains.
+  // Must precede begin(). At 1 frame/s (~55 B) this holds ~9s of frames
+  // (~0.5s if the line were saturated at 960 B/s). Only a hanging MQTT connect
+  // (up to ~11s, while nothing can be published anyway) can overflow it, and
+  // the overflow handling in loop() then drops the backlog and resyncs, so no
+  // glued/corrupt frame is ever published. Kept small to save RAM.
+  testSerial.setRxBufferSize(512);
   testSerial.begin(9600, SERIAL_8N1, STM_RX, STM_TX);
   // Count hardware receive errors (framing/parity/break/overflow) so we can
   // tell wire noise from ESP32-side losses. See "STM32 UART diagnostics".
@@ -305,7 +419,7 @@ void setup() {
 
   // ---- Web routes ----
   server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html);
+    request->send(200, "text/html", index_html);   // PROGMEM page, sent from flash
   });
 
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -317,16 +431,19 @@ void setup() {
   });
 
   server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
+    // All three are required: getParam() returns nullptr for a missing one and
+    // dereferencing it crashed the device.
+    if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2) &&
+        request->hasParam(PARAM_INPUT_3)) {
       param_ssid = request->getParam(PARAM_INPUT_1)->value();
       param_password = request->getParam(PARAM_INPUT_2)->value();
       uid = request->getParam(PARAM_INPUT_3)->value();
       isStartConnect = true;
       lastScanRequest = 0;
       WiFi.disconnect();
-      request->send_P(200, "text/plain", connectSuccess().c_str());
+      request->send(200, "text/plain", connectSuccess());
     } else {
-      request->send_P(200, "text/plain", connectError().c_str());
+      request->send(200, "text/plain", connectError());
     }
   });
 
@@ -334,11 +451,11 @@ void setup() {
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.reconnect();
     }
-    request->send_P(200, "text/plain", String(statusWifi()).c_str());
+    request->send(200, "text/plain", String(statusWifi()));
   });
 
   server.on("/mqtt-status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/plain", String(mqttStatus()).c_str());
+    request->send(200, "text/plain", String(mqttStatus()));
   });
 
   server.on("/connect-status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -350,7 +467,7 @@ void setup() {
 
   server.on("/change-mode-wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
     isStartChangeModeWifi = true;
-    request->send_P(200, "text/plain", connectSuccess().c_str());
+    request->send(200, "text/plain", connectSuccess());
   });
 
   server.begin();
@@ -360,6 +477,65 @@ void loop() {
   unsigned long currentMillis = millis();
 
   esp_task_wdt_reset();  // feed the watchdog each iteration
+
+  // Drain the STM32 UART every iteration, char by char. A frame ends at '*',
+  // a null, or a newline ('\n'/'\r'); only VALID frames (acceptFrame) are
+  // stashed in stmLatestFrame for the publish tick below, so two glued or
+  // truncated frames are never published. (Kept print-free — hot path.)
+  //
+  // stmSkipToTerminator drops everything up to the next terminator. It starts
+  // true because the first bytes after boot are usually the middle of a frame.
+  static bool stmSkipToTerminator = true;
+
+  // RX overflow: bytes were lost somewhere inside the current backlog and we
+  // can't tell where, so a later "frame" may be the tail of one frame glued to
+  // the head of another. Drop the whole backlog and resync on a terminator.
+  // (Loses a few seconds of frames; overflow only happens while loop() was
+  // blocked, e.g. in a failing MQTT reconnect when nothing is published anyway.)
+  if (s_uartOverflow) {
+    s_uartOverflow = false;
+    while (testSerial.available()) testSerial.read();
+    if (stmMsgBuffer.length() > 0) rejectFrame(UC_DROP_HWERR, stmMsgBuffer);
+    stmMsgBuffer = "";
+    s_uartErrorInFrame = false;
+    stmSkipToTerminator = true;
+  }
+
+  while (testSerial.available()) {
+    char c = (char)testSerial.read();
+    if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
+      // A HW receive error (bit error / break) happened while this frame was
+      // on the wire. Consumed per frame so it never leaks into the next.
+      bool hwError = s_uartErrorInFrame;
+      s_uartErrorInFrame = false;
+      if (stmSkipToTerminator) {
+        stmSkipToTerminator = false;     // end of a partial/garbage line: drop it
+      } else if (stmMsgBuffer.length() > 0) {
+        String frame = stmMsgBuffer;
+        frame.trim();
+        if (acceptFrame(frame, hwError)) {
+          stmLatestFrame = frame;        // keep only the most recent valid frame
+          DBG_PRINT("[STM32] ");
+          DBG_PRINTLN(frame);
+        } else {
+          DBG_PRINT("[STM32] rejected: ");
+          DBG_PRINTLN(escapeFrame(frame));
+        }
+      }
+      stmMsgBuffer = "";
+    } else if (!stmSkipToTerminator) {
+      stmMsgBuffer += c;
+      if ((int)stmMsgBuffer.length() > STM_FRAME_MAX) {
+        // Terminator never arrived: drop this line AND its tail up to the next
+        // terminator (the tail would otherwise look like a new frame).
+        rejectFrame(UC_TOO_LONG, stmMsgBuffer);
+        stmMsgBuffer = "";
+        stmSkipToTerminator = true;
+      }
+    }
+  }
+  reportUartStats(currentMillis);        // UART_STATS / STM32_BAD_FRAME every 5 min
+  reportMemStats(currentMillis);         // STACK_STATS every 30 min
 
   // MQTT service + flush any OTA status the worker produced.
   mqttClient.loop();
@@ -608,87 +784,32 @@ void loop() {
     WiFi.scanDelete();
   }
 
-  // Drain the STM32 UART every loop so the RX buffer never backs up (works at
-  // any STM32 send cadence). Bytes accumulate across iterations until a
-  // terminator ('*', NUL, newline); the partial tail survives between loops, so
-  // a read landing mid-transmission never loses a frame's head. Each completed
-  // frame is validated (10 or 12 '#'-separated fields) and the newest valid one
-  // is kept for the next publish tick. No flush needed — the drain IS the flush.
-  static String latestStmFrame = "";   // most recent valid frame, awaiting publish
-  {
-    static String rxAccum = "";
-    static bool   skipToTerminator = false;   // after an over-long line
-    static bool   frameHasBadChar = false;
-    while (testSerial.available()) {
-      char c = (char)testSerial.read();
-      if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
-        // A HW receive error (bit error / overflow) happened while this frame
-        // was on the wire: its content can't be trusted.
-        bool hwError = s_uartErrorInFrame;
-        s_uartErrorInFrame = false;
-        rxAccum.trim();
-        if (skipToTerminator) {
-          skipToTerminator = false;         // end of the over-long garbage
-        } else if (!rxAccum.isEmpty()) {
-          // Split into '#'-separated fields and validate each one.
-          int startIndex = 0;
-          int tokenCount = 0;
-          bool allNumeric = true;
-          while (startIndex < (int)rxAccum.length()) {
-            int endIndex = rxAccum.indexOf('#', startIndex);
-            if (endIndex == -1) endIndex = rxAccum.length();
-            if (allNumeric &&
-                !isNumericField(rxAccum.substring(startIndex, endIndex), tokenCount == 0)) {
-              allNumeric = false;
-            }
-            tokenCount++;
-            startIndex = endIndex + 1;
-          }
-          // Raw dump: exact frame content, field count, len, and the terminator
-          // byte (hex) that ended it — use this to spot stray '#'/garbage fields.
-          DBG_PRINT("[STM32] frame=[");  DBG_PRINT(rxAccum);
-          DBG_PRINT("] tokens=");        DBG_PRINT(tokenCount);
-          DBG_PRINT(" len=");            DBG_PRINT(rxAccum.length());
-          DBG_PRINT(" term=0x");         DBG_PRINTLN((int)(uint8_t)c, HEX);
-
-          if (hwError) {
-            rejectFrame(UC_DROP_HWERR, rxAccum);
-          } else if (frameHasBadChar) {
-            rejectFrame(UC_BAD_CHAR, rxAccum);
-          } else if (tokenCount != 10 && tokenCount != 12) {
-            rejectFrame(UC_BAD_FIELDS, rxAccum);
-          } else {
-            // Non-numeric fields are only COUNTED for now (diagnostics); the
-            // frame is still forwarded as before.
-            if (!allNumeric) rejectFrame(UC_BAD_NUMBER, rxAccum);
-            else uartCount(UC_OK);
-            latestStmFrame = rxAccum;   // keep as newest
-          }
-        }
-        rxAccum = "";
-        frameHasBadChar = false;
-      } else if (!skipToTerminator) {
-        uint8_t b = (uint8_t)c;
-        if (b < 0x20 || b > 0x7E) frameHasBadChar = true;
-        rxAccum += c;
-        if (rxAccum.length() > 256) {
-          // Terminator never arrived: drop this line AND everything up to the
-          // next terminator (its tail would otherwise look like a new frame).
-          rejectFrame(UC_TOO_LONG, rxAccum);
-          rxAccum = "";
-          frameHasBadChar = false;
-          skipToTerminator = true;
-        }
-      }
-    }
-  }
-  reportUartStats(currentMillis);
-
-  // Publish the newest valid STM32 frame over MQTT (rate-limited to every 3s).
+  // Publish the latest complete STM32 frame over MQTT (every 1s). Frames are
+  // assembled char-by-char by the UART drain at the top of loop().
   if (currentMillis - previousMillis >= interval && isMqttConnected) {
     previousMillis = currentMillis;
-    if (!latestStmFrame.isEmpty()) {
-      String jsonString = "{\"value\":\"" + latestStmFrame + "\"}";
+
+    // Consume the most recent complete frame (empty if none arrived this second).
+    String res = stmLatestFrame;
+    stmLatestFrame = "";
+    res.trim();
+
+    DBG_PRINT("STM32 frame: [");
+    DBG_PRINT(res);
+    DBG_PRINTLN("]");
+
+    if (res.isEmpty()) {
+      DBG_PRINTLN("No data from STM32");
+      DBG_PRINTLN("=======================");
+    } else {
+      String jsonString = "{\"value\":\"" + res + "\"}";
+
+      DBG_PRINTLN("=== Publishing to MQTT ===");
+      DBG_PRINT("Topic: ");
+      DBG_PRINTLN(MQTT_TOPIC_DATA);
+      DBG_PRINT("Payload: ");
+      DBG_PRINTLN(jsonString);
+
       if (!MQTT_TOPIC_DATA.isEmpty()) {
         String signedJsonString = createSignedMessage(jsonString);
         bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
@@ -697,7 +818,6 @@ void loop() {
         DBG_PRINT(" -> ");
         DBG_PRINTLN(dataPublished ? "SUCCESS" : "FAILED");
       }
-      latestStmFrame = "";   // clear so only fresh frames get published
     }
   }
 
