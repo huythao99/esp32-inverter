@@ -4,6 +4,7 @@
 #include "time.h"
 #include "esp_sntp.h"
 #include "esp_task_wdt.h"
+#include "esp_system.h"
 #include <math.h>
 
 #include "config.h"
@@ -76,6 +77,246 @@ int wifiConnectResult = -1;
 unsigned long connectAttemptStart = 0;
 const long connectTimeout = 15000;
 
+// ---------------------------------------------------------------------------
+// STM32 UART diagnostics
+//
+// Tells line/electrical problems apart from ESP32-side losses:
+//  - hardware errors reported by the UART driver (onReceiveError):
+//      FRAME / PARITY / BREAK  -> bit errors on the wire (noise, bad GND,
+//                                 baud mismatch, floating RX)
+//      FIFO_OVF / BUFFER_FULL  -> the ESP32 did not read fast enough
+//  - frames rejected by acceptFrame() (wrong field count, non-numeric field,
+//    non-printable byte, over-long line). Rejected frames are NOT published.
+// Counters are reported as deltas every kUartReportMs via trackLog
+// ("UART_STATS") together with one escaped sample of a rejected frame
+// ("STM32_BAD_FRAME"). Only sent when something went wrong.
+// ---------------------------------------------------------------------------
+enum UartCounter : uint8_t {
+  UC_OK = 0,        // valid frames accepted
+  UC_HW_FRAME,      // UART framing error (stop bit not found)
+  UC_HW_PARITY,     // parity error (8N1 -> should stay 0)
+  UC_HW_BREAK,      // line held low (disconnected / reset STM32)
+  UC_HW_FIFO_OVF,   // hardware FIFO overflow
+  UC_HW_BUF_FULL,   // RX ring buffer full (loop() blocked too long)
+  UC_DROP_HWERR,    // frames dropped: HW error / RX overflow hit them
+  UC_BAD_FIELDS,    // field count not 10/12
+  UC_BAD_NUMBER,    // a field is not a plain number
+  UC_BAD_CHAR,      // frame contained a non-printable byte
+  UC_TOO_LONG,      // no terminator within 256 bytes
+  UC_COUNT
+};
+static volatile uint32_t s_uartCounters[UC_COUNT] = {0};
+static portMUX_TYPE     s_uartMux = portMUX_INITIALIZER_UNLOCKED;
+// Set by the UART error callback: the frame being assembled is corrupt.
+static volatile bool    s_uartErrorInFrame = false;
+// Set on RX overflow (HW FIFO / ring buffer full): bytes were lost somewhere
+// in what is buffered right now, so the whole backlog can't be trusted.
+static volatile bool    s_uartOverflow = false;
+static String           s_lastBadFrame;        // escaped sample, Core 1 only
+static unsigned long    s_lastUartReport = 0;
+static const unsigned long kUartReportMs = 300000;   // 5 min
+
+static inline void uartCount(UartCounter c) {
+  portENTER_CRITICAL(&s_uartMux);
+  s_uartCounters[c]++;
+  portEXIT_CRITICAL(&s_uartMux);
+}
+
+// Runs on the UART event task (not Core 1's loop) — keep it tiny.
+static void onStmUartError(hardwareSerial_error_t err) {
+  switch (err) {
+    case UART_FRAME_ERROR:       uartCount(UC_HW_FRAME);    break;
+    case UART_PARITY_ERROR:      uartCount(UC_HW_PARITY);   break;
+    case UART_BREAK_ERROR:       uartCount(UC_HW_BREAK);    break;
+    case UART_FIFO_OVF_ERROR:    uartCount(UC_HW_FIFO_OVF); s_uartOverflow = true; break;
+    case UART_BUFFER_FULL_ERROR: uartCount(UC_HW_BUF_FULL); s_uartOverflow = true; break;
+    default: return;
+  }
+  s_uartErrorInFrame = true;
+}
+
+// Printable copy of a frame for the log: non-printable bytes as \xNN,
+// truncated so it fits the 100-byte trackLog message.
+static String escapeFrame(const String& in) {
+  String out;
+  out.reserve(80);
+  for (unsigned int i = 0; i < in.length() && out.length() < 72; i++) {
+    uint8_t b = (uint8_t)in[i];
+    if (b >= 0x20 && b <= 0x7E) {
+      out += (char)b;
+    } else {
+      char hex[5];
+      snprintf(hex, sizeof(hex), "\\x%02X", b);
+      out += hex;
+    }
+  }
+  if (in.length() > 0 && out.length() >= 72) out += "...";
+  return out;
+}
+
+// A field may be: optional leading '$' (first field only), optional sign,
+// digits with at most one '.'.
+static bool isNumericField(const String& f, bool first) {
+  unsigned int i = 0;
+  if (first && i < f.length() && f[i] == '$') i++;
+  if (i < f.length() && (f[i] == '-' || f[i] == '+')) i++;
+  bool digit = false, dot = false;
+  for (; i < f.length(); i++) {
+    char c = f[i];
+    if (c >= '0' && c <= '9') { digit = true; continue; }
+    if (c == '.' && !dot) { dot = true; continue; }
+    return false;
+  }
+  return digit;
+}
+
+static void rejectFrame(UartCounter reason, const String& frame) {
+  uartCount(reason);
+  s_lastBadFrame = escapeFrame(frame);
+}
+
+// Field count this STM32 sends (10 or 12), learned from the first valid frame
+// after boot. A frame whose head was lost can still split into exactly 10
+// fields (a 12-field frame minus its first two), so once the count is known a
+// different count is rejected — unless it repeats kFieldRelearnRun times in a
+// row (the STM32 firmware really changed).
+static int s_expectedFields = 0;       // 0 = not learned yet
+static int s_otherFields = 0;
+static int s_otherFieldsRun = 0;
+static const int kFieldRelearnRun = 5;
+
+// Validate a completed (trimmed) frame. Returns true when it may be published.
+// Rejected frames are counted for UART_STATS and one escaped sample is kept
+// for STM32_BAD_FRAME. A frame that passes here contains only digits, '.',
+// '+', '-', '#' and an optional leading '$', so it is also JSON-safe.
+static bool acceptFrame(const String& frame, bool hwError) {
+  if (hwError) { rejectFrame(UC_DROP_HWERR, frame); return false; }
+
+  int fields = 0;
+  bool allNumeric = true;
+  bool badChar = false;
+  const int len = frame.length();
+  for (int i = 0; i < len; i++) {
+    uint8_t b = (uint8_t)frame[i];
+    if (b < 0x20 || b > 0x7E) { badChar = true; break; }
+  }
+  // Same field split the backend uses; a trailing '#' adds no empty field.
+  int start = 0;
+  while (start < len) {
+    int end = frame.indexOf('#', start);
+    if (end == -1) end = len;
+    if (allNumeric && !isNumericField(frame.substring(start, end), fields == 0)) {
+      allNumeric = false;
+    }
+    fields++;
+    start = end + 1;
+  }
+
+  if (badChar)                           { rejectFrame(UC_BAD_CHAR, frame);   return false; }
+  if (fields != 10 && fields != 12)      { rejectFrame(UC_BAD_FIELDS, frame); return false; }
+  if (!allNumeric)                       { rejectFrame(UC_BAD_NUMBER, frame); return false; }
+
+  if (s_expectedFields == 0 || fields == s_expectedFields) {
+    s_expectedFields = fields;
+    s_otherFieldsRun = 0;
+  } else {
+    s_otherFieldsRun = (fields == s_otherFields) ? s_otherFieldsRun + 1 : 1;
+    s_otherFields = fields;
+    if (s_otherFieldsRun < kFieldRelearnRun) {
+      rejectFrame(UC_BAD_FIELDS, frame);
+      return false;
+    }
+    s_expectedFields = fields;           // consistent new format: adopt it
+    s_otherFieldsRun = 0;
+  }
+  uartCount(UC_OK);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Memory diagnostics: heap + task stack high-water marks, sent every
+// kMemReportMs as "STACK_STATS" (and once ~2 min after boot). Used to size the
+// task stacks safely (async_tcp via CONFIG_ASYNC_TCP_STACK_SIZE, http_worker in
+// workerInit()). Values: bytes; stack = minimum free stack ever seen (-1 if the
+// task doesn't exist yet).
+// ---------------------------------------------------------------------------
+static unsigned long s_lastMemReport = 0;
+static bool          s_firstMemReportDone = false;
+static const unsigned long kMemReportMs = 1800000;     // 30 min
+static const unsigned long kFirstMemReportMs = 120000; // 2 min after boot
+
+static long stackFreeBytes(const char* taskName) {
+  TaskHandle_t h = xTaskGetHandle(taskName);
+  if (h == nullptr) return -1;
+  return (long)uxTaskGetStackHighWaterMark(h);   // ESP-IDF: in bytes
+}
+
+static void reportMemStats(unsigned long now) {
+  if (!s_firstMemReportDone) {
+    if (now < kFirstMemReportMs) return;
+    s_firstMemReportDone = true;
+  } else if (now - s_lastMemReport < kMemReportMs) {
+    return;
+  }
+  s_lastMemReport = now;
+
+  char msg[100];
+  snprintf(msg, sizeof(msg),
+           "heap=%u min=%u blk=%u loop=%ld worker=%ld async=%ld",
+           (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+           (unsigned)ESP.getMaxAllocHeap(),
+           (long)uxTaskGetStackHighWaterMark(nullptr),   // this (loop) task
+           stackFreeBytes("http_worker"), stackFreeBytes("async_tcp"));
+  trackLog("STACK_STATS", String(msg), kMemReportMs - 1000);
+  DBG_PRINT("[MEM] "); DBG_PRINTLN(msg);
+}
+
+// Send the counters (as deltas) when anything went wrong in the last period.
+static void reportUartStats(unsigned long now) {
+  if (now - s_lastUartReport < kUartReportMs) return;
+  s_lastUartReport = now;
+
+  uint32_t c[UC_COUNT];
+  portENTER_CRITICAL(&s_uartMux);
+  for (int i = 0; i < UC_COUNT; i++) { c[i] = s_uartCounters[i]; s_uartCounters[i] = 0; }
+  portEXIT_CRITICAL(&s_uartMux);
+
+  uint32_t problems = 0;
+  for (int i = 1; i < UC_COUNT; i++) problems += c[i];
+  if (problems == 0) { s_lastBadFrame = ""; return; }
+
+  char msg[100];
+  snprintf(msg, sizeof(msg),
+           "ok=%lu fe=%lu pe=%lu brk=%lu ovf=%lu full=%lu drop=%lu fld=%lu num=%lu chr=%lu long=%lu",
+           (unsigned long)c[UC_OK], (unsigned long)c[UC_HW_FRAME], (unsigned long)c[UC_HW_PARITY],
+           (unsigned long)c[UC_HW_BREAK], (unsigned long)c[UC_HW_FIFO_OVF],
+           (unsigned long)c[UC_HW_BUF_FULL], (unsigned long)c[UC_DROP_HWERR],
+           (unsigned long)c[UC_BAD_FIELDS], (unsigned long)c[UC_BAD_NUMBER],
+           (unsigned long)c[UC_BAD_CHAR], (unsigned long)c[UC_TOO_LONG]);
+  trackLog("UART_STATS", String(msg), kUartReportMs - 1000);
+  DBG_PRINT("[UART] "); DBG_PRINTLN(msg);
+  if (!s_lastBadFrame.isEmpty()) {
+    trackLog("STM32_BAD_FRAME", s_lastBadFrame, kUartReportMs - 1000);
+    DBG_PRINT("[UART] bad frame sample: "); DBG_PRINTLN(s_lastBadFrame);
+    s_lastBadFrame = "";
+  }
+}
+
+// Delay between receiving cmd/restart and actually rebooting.
+static const unsigned long kRestartDelayMs = 1500;
+
+// SNTP state (Core 1 only).
+static bool          ntpStarted = false;
+static unsigned long ntpStartedAt = 0;
+static const unsigned long kNtpRetryMs = 60000;
+
+static void startNtp(unsigned long now) {
+  sntp_set_time_sync_notification_cb(onNtpSync);
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer, ntpServer2, ntpServer3);
+  ntpStarted = true;
+  ntpStartedAt = now;
+}
+
 // ---- Small helpers for the web routes -------------------------------------
 static String connectSuccess() { return "success"; }
 static String connectError()   { return "error"; }
@@ -90,8 +331,16 @@ void setup() {
 
   // Hardware UART2 for the STM32 link. Enlarge the RX FIFO/ring buffer so bytes
   // are never dropped even if loop() is briefly busy between drains.
-  testSerial.setRxBufferSize(1024);
+  // Must precede begin(). At 1 frame/s (~55 B) this holds ~9s of frames
+  // (~0.5s if the line were saturated at 960 B/s). Only a hanging MQTT connect
+  // (up to ~11s, while nothing can be published anyway) can overflow it, and
+  // the overflow handling in loop() then drops the backlog and resyncs, so no
+  // glued/corrupt frame is ever published. Kept small to save RAM.
+  testSerial.setRxBufferSize(512);
   testSerial.begin(9600, SERIAL_8N1, STM_RX, STM_TX);
+  // Count hardware receive errors (framing/parity/break/overflow) so we can
+  // tell wire noise from ESP32-side losses. See "STM32 UART diagnostics".
+  testSerial.onReceiveError(onStmUartError);
   DBG_PRINT("STM32 Serial: RX=");
   DBG_PRINT(STM_RX);
   DBG_PRINT(", TX=");
@@ -131,6 +380,18 @@ void setup() {
     DBG_PRINTLN(lastSetupValue);
   }
 
+  // Last known schedule from NVS: runs until the first successful fetch, so a
+  // reboot while the server is unreachable doesn't drop the schedule.
+  // (Before workerInit(): no other task touches schedules[] yet.)
+  {
+    String storedSchedule = loadScheduleFromStorage();
+    if (!storedSchedule.isEmpty()) {
+      parseScheduleData(storedSchedule);
+      DBG_PRINT("Loaded schedule from storage, count=");
+      DBG_PRINTLN(scheduleCount);
+    }
+  }
+
   netHttpInit();
 
   // MQTT init
@@ -158,7 +419,7 @@ void setup() {
 
   // ---- Web routes ----
   server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html);
+    request->send(200, "text/html", index_html);   // PROGMEM page, sent from flash
   });
 
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -170,16 +431,19 @@ void setup() {
   });
 
   server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){
-    if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
+    // All three are required: getParam() returns nullptr for a missing one and
+    // dereferencing it crashed the device.
+    if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2) &&
+        request->hasParam(PARAM_INPUT_3)) {
       param_ssid = request->getParam(PARAM_INPUT_1)->value();
       param_password = request->getParam(PARAM_INPUT_2)->value();
       uid = request->getParam(PARAM_INPUT_3)->value();
       isStartConnect = true;
       lastScanRequest = 0;
       WiFi.disconnect();
-      request->send_P(200, "text/plain", connectSuccess().c_str());
+      request->send(200, "text/plain", connectSuccess());
     } else {
-      request->send_P(200, "text/plain", connectError().c_str());
+      request->send(200, "text/plain", connectError());
     }
   });
 
@@ -187,11 +451,11 @@ void setup() {
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.reconnect();
     }
-    request->send_P(200, "text/plain", String(statusWifi()).c_str());
+    request->send(200, "text/plain", String(statusWifi()));
   });
 
   server.on("/mqtt-status", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send_P(200, "text/plain", String(mqttStatus()).c_str());
+    request->send(200, "text/plain", String(mqttStatus()));
   });
 
   server.on("/connect-status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -203,7 +467,7 @@ void setup() {
 
   server.on("/change-mode-wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
     isStartChangeModeWifi = true;
-    request->send_P(200, "text/plain", connectSuccess().c_str());
+    request->send(200, "text/plain", connectSuccess());
   });
 
   server.begin();
@@ -214,26 +478,64 @@ void loop() {
 
   esp_task_wdt_reset();  // feed the watchdog each iteration
 
-  // Drain the STM32 UART every iteration, char by char, so no byte is lost even
-  // if a later part of loop() runs long. A frame ends at '*', a null, or a
-  // newline ('\n'/'\r'); the newest complete frame is stashed in stmLatestFrame
-  // for the 1s publish tick below. (Kept print-free — this is a hot path.)
+  // Drain the STM32 UART every iteration, char by char. A frame ends at '*',
+  // a null, or a newline ('\n'/'\r'); only VALID frames (acceptFrame) are
+  // stashed in stmLatestFrame for the publish tick below, so two glued or
+  // truncated frames are never published. (Kept print-free — hot path.)
+  //
+  // stmSkipToTerminator drops everything up to the next terminator. It starts
+  // true because the first bytes after boot are usually the middle of a frame.
+  static bool stmSkipToTerminator = true;
+
+  // RX overflow: bytes were lost somewhere inside the current backlog and we
+  // can't tell where, so a later "frame" may be the tail of one frame glued to
+  // the head of another. Drop the whole backlog and resync on a terminator.
+  // (Loses a few seconds of frames; overflow only happens while loop() was
+  // blocked, e.g. in a failing MQTT reconnect when nothing is published anyway.)
+  if (s_uartOverflow) {
+    s_uartOverflow = false;
+    while (testSerial.available()) testSerial.read();
+    if (stmMsgBuffer.length() > 0) rejectFrame(UC_DROP_HWERR, stmMsgBuffer);
+    stmMsgBuffer = "";
+    s_uartErrorInFrame = false;
+    stmSkipToTerminator = true;
+  }
+
   while (testSerial.available()) {
     char c = (char)testSerial.read();
     if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
-      if (stmMsgBuffer.length() > 0) {
-        stmLatestFrame = stmMsgBuffer;   // keep only the most recent complete frame
-        DBG_PRINT("[STM32] ");
-        DBG_PRINTLN(stmMsgBuffer);       // print each complete frame as it arrives
+      // A HW receive error (bit error / break) happened while this frame was
+      // on the wire. Consumed per frame so it never leaks into the next.
+      bool hwError = s_uartErrorInFrame;
+      s_uartErrorInFrame = false;
+      if (stmSkipToTerminator) {
+        stmSkipToTerminator = false;     // end of a partial/garbage line: drop it
+      } else if (stmMsgBuffer.length() > 0) {
+        String frame = stmMsgBuffer;
+        frame.trim();
+        if (acceptFrame(frame, hwError)) {
+          stmLatestFrame = frame;        // keep only the most recent valid frame
+          DBG_PRINT("[STM32] ");
+          DBG_PRINTLN(frame);
+        } else {
+          DBG_PRINT("[STM32] rejected: ");
+          DBG_PRINTLN(escapeFrame(frame));
+        }
       }
       stmMsgBuffer = "";
-    } else {
+    } else if (!stmSkipToTerminator) {
       stmMsgBuffer += c;
       if ((int)stmMsgBuffer.length() > STM_FRAME_MAX) {
-        stmMsgBuffer = "";               // garbled/never-terminated stream: resync
+        // Terminator never arrived: drop this line AND its tail up to the next
+        // terminator (the tail would otherwise look like a new frame).
+        rejectFrame(UC_TOO_LONG, stmMsgBuffer);
+        stmMsgBuffer = "";
+        stmSkipToTerminator = true;
       }
     }
   }
+  reportUartStats(currentMillis);        // UART_STATS / STM32_BAD_FRAME every 5 min
+  reportMemStats(currentMillis);         // STACK_STATS every 30 min
 
   // MQTT service + flush any OTA status the worker produced.
   mqttClient.loop();
@@ -262,6 +564,20 @@ void loop() {
     requestOTA();
   }
 
+  // Remote restart requested over MQTT (cmd/restart). Wait a moment so the
+  // QoS 1 PUBACK actually leaves the socket (no redelivery after boot), and
+  // never reboot in the middle of an OTA flash. The STM32 keeps running on its
+  // last value meanwhile; applyCurrentValue() re-sends it after boot.
+  if (restartPending && !otaPending && !otaInProgress &&
+      currentMillis - restartAt >= kRestartDelayMs) {
+    restartPending = false;
+    // No "restarting" status publish: apps treat any status message as
+    // "online" and would briefly show the device online while it reboots.
+    mqttClient.disconnect();
+    delay(200);   // let the TCP stack flush the disconnect
+    ESP.restart();
+  }
+
   // WiFi AP mode toggle (user-initiated, rare). Kept blocking: it only runs on
   // an explicit /change-mode-wifi request.
   if (isStartChangeModeWifi) {
@@ -278,7 +594,17 @@ void loop() {
   if (wifiResetPending && currentMillis - wifiResetAt >= 1000) {
     wifiResetPending = false;
     WiFi.begin(param_ssid.c_str(), param_password.c_str());
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  }
+
+  // NTP: start SNTP once WiFi is up, then leave it running (it re-syncs by
+  // itself every hour). While the clock is STILL unset, restart it every
+  // kNtpRetryMs: after failed attempts lwIP backs off exponentially, and at
+  // boot the first request often fails because DNS is not ready yet.
+  // (Previously configTime() ran on every loop pass while MQTT kept failing,
+  // which aborted each in-flight NTP request so the clock never got set.)
+  if (WiFi.status() == WL_CONNECTED &&
+      (!ntpStarted || (!isTimeValid() && currentMillis - ntpStartedAt >= kNtpRetryMs))) {
+    startNtp(currentMillis);
   }
 
   // Start a setup-page connection attempt.
@@ -313,8 +639,6 @@ void loop() {
 
   // Connect MQTT once WiFi is up.
   if (WiFi.status() == WL_CONNECTED && isStartMqtt) {
-    sntp_set_time_sync_notification_cb(onNtpSync);
-    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     writeInfo(param_ssid, param_password, uid);
 
     if (connectToMqtt()) {
@@ -378,12 +702,53 @@ void loop() {
     previousMillisApply = currentMillis;
   }
 
+  // Report why the device (re)booted, once it is online, so a remote restart
+  // (or a crash / watchdog reset) is visible in the backend error log.
+  static bool bootReasonLogged = false;
+  if (!bootReasonLogged && isMqttConnected) {
+    bootReasonLogged = true;
+    trackLog("BOOT", "reset_reason=" + String((int)esp_reset_reason()) +
+                     " fw=" + currentFirmwareVersion);
+  }
+
   // Log NTP sync from loop() (safe) rather than the SNTP callback.
   static bool ntpSyncLogged = false;
   if (isNtpSynced && !ntpSyncLogged) {
     ntpSyncLogged = true;
     trackLog("NTP_SYNCED", "Time synchronized successfully");
   }
+
+  // Clock set by the HTTP Date fallback while NTP is still unreachable: report
+  // once so the backend can see which devices have UDP 123 blocked.
+  static bool httpTimeLogged = false;
+  if (!isNtpSynced && !httpTimeLogged && isTimeValid()) {
+    httpTimeLogged = true;
+    trackLog("TIME_FROM_HTTP", "Clock set from HTTP Date header (NTP not reachable yet)");
+  }
+
+#if DEBUG
+  // NTP diagnostic on USB serial (every 5s): sync flag, SNTP status, epoch, time.
+  // Only in DEBUG builds: sntp_get_sync_status() consumes the COMPLETED state.
+  static unsigned long previousMillisNtpDbg = 0;
+  if (currentMillis - previousMillisNtpDbg >= 5000) {
+    previousMillisNtpDbg = currentMillis;
+    sntp_sync_status_t st = sntp_get_sync_status();
+    const char* stStr = (st == SNTP_SYNC_STATUS_COMPLETED)   ? "COMPLETED"
+                      : (st == SNTP_SYNC_STATUS_IN_PROGRESS) ? "IN_PROGRESS"
+                                                             : "RESET";
+    time_t nowEpoch = time(nullptr);
+    struct tm ti;
+    char buf[20] = "----";
+    if (getLocalTime(&ti, 10)) strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ti);
+    DBG_PRINT("[NTP] synced=");  DBG_PRINT(isNtpSynced ? "1" : "0");
+    DBG_PRINT(" status=");       DBG_PRINT(stStr);
+    DBG_PRINT(" epoch=");        DBG_PRINT((long)nowEpoch);
+    DBG_PRINT(" time=");         DBG_PRINTLN(buf);
+    if (!isNtpSynced && nowEpoch < 1600000000) {
+      DBG_PRINTLN("[NTP] ERROR: clock not set - NTP not reached (check server/DNS/UDP123)");
+    }
+  }
+#endif
 
   // Single writer to the STM32: share > schedule > setting, every 1s.
   if (currentMillis - previousMillisApply >= intervalApply) {
@@ -448,12 +813,11 @@ void loop() {
       if (!MQTT_TOPIC_DATA.isEmpty()) {
         String signedJsonString = createSignedMessage(jsonString);
         bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
-        DBG_PRINT("Publish result: ");
+        DBG_PRINT("[STM32] publish ");
+        DBG_PRINT(jsonString);
+        DBG_PRINT(" -> ");
         DBG_PRINTLN(dataPublished ? "SUCCESS" : "FAILED");
-      } else {
-        DBG_PRINTLN("MQTT_TOPIC_DATA is empty!");
       }
-      DBG_PRINTLN("=======================");
     }
   }
 
@@ -465,20 +829,26 @@ void loop() {
     connectMqtt = 0;
   }
 
-  // Periodic online status publish.
+  // Periodic online status publish (heartbeat, every intervalMqtt).
+  // ALWAYS published, even before the clock is set: apps use this message as
+  // the online signal, so gating it on NTP made devices look offline whenever
+  // NTP was unreachable. `updatedAt` is only included once the clock is valid;
+  // `uptime` (seconds since boot) is always there.
   if (currentMillis - previousMillisMqtt >= intervalMqtt) {
     previousMillisMqtt = currentMillis;
-    if (isMqttConnected && mqttClient.connected()) {
-      struct tm timeinfo;
-      if (getLocalTime(&timeinfo, 10)) {   // short timeout: never blocks the loop
-        char timeStringBuff[50];
-        strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-        if (!MQTT_TOPIC_STATUS.isEmpty()) {
-          String statusMsg = "{\"updatedAt\":\"" + String(timeStringBuff) + "\",\"status\":\"online\"}";
-          String signedStatusMsg = createSignedMessage(statusMsg);
-          mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
+    if (isMqttConnected && mqttClient.connected() && !MQTT_TOPIC_STATUS.isEmpty()) {
+      String statusMsg = "{";
+      if (isTimeValid()) {
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo, 10)) {   // short timeout: never blocks the loop
+          char timeStringBuff[32];
+          strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+          statusMsg += "\"updatedAt\":\"" + String(timeStringBuff) + "\",";
         }
       }
+      statusMsg += "\"status\":\"online\",\"uptime\":" + String(currentMillis / 1000) + "}";
+      String signedStatusMsg = createSignedMessage(statusMsg);
+      mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
     }
   }
 

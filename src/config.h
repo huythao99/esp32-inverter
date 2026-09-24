@@ -8,7 +8,7 @@
 // Debug logging. Set DEBUG to 0 for production to compile out all USB-serial
 // debug output (removes ~90 blocking Serial.print calls from the hot paths).
 // Note: this only affects the USB Serial; the STM32 link (testSerial) is untouched.
-#define DEBUG 0
+#define DEBUG 1
 #if DEBUG
   #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
   #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
@@ -17,7 +17,7 @@
   #define DBG_PRINTLN(...) do {} while (0)
 #endif
 
-#define WIFI_BROADCAST_SSID "GTIControl1375"
+#define WIFI_BROADCAST_SSID "GTIControl1369"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"

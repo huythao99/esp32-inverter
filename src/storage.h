@@ -18,6 +18,13 @@ String getUid();
 void   saveSettingToStorage(const String& value);
 String loadSettingFromStorage();
 
+// Schedule persistence (NVS): the raw schedule string from the server, so a
+// rebooted device keeps running its schedule even if the server/API is not
+// reachable yet. Only writes when the value actually changed (flash wear).
+// Core 0 (worker) only after setup().
+void   saveScheduleToStorage(const String& schedule);
+String loadScheduleFromStorage();
+
 // Broadcast SSID persistence (NVS) — set once, survives firmware uploads.
 void   saveWifiBroadcastSSID(const String& ssid);
 String loadWifiBroadcastSSID();

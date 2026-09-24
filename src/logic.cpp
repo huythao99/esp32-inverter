@@ -3,7 +3,6 @@
 #include "config.h"
 #include "worker.h"   // trackLog() (enqueues; non-blocking)
 #include "time.h"
-#include "esp_sntp.h"
 
 String convertSetupValue(const String& input) {
   if (input.length() != 8) {
@@ -82,14 +81,12 @@ void parseScheduleData(const String& scheduleData) {
 
 String currentScheduleValue() {
   if (scheduleCount <= 0) return "";
-  // Fallback: callback may not fire if NTP synced before it was registered.
-  if (!isNtpSynced) {
-    if (sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-      isNtpSynced = true;
-    } else {
-      trackLog("NTP_NOT_SYNCED", "NTP not ready, schedule skipped", 120000);
-      return "";
-    }
+  // Check the clock itself instead of the SNTP status: sntp_get_sync_status()
+  // reports COMPLETED only ONCE (then resets), and the clock may also have been
+  // set by the HTTP Date fallback without SNTP ever succeeding.
+  if (!isTimeValid()) {
+    trackLog("NTP_NOT_SYNCED", "Clock not set yet (no NTP/HTTP time), schedule skipped", 120000);
+    return "";
   }
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo, 10)) return "";   // short timeout: never blocks
@@ -148,6 +145,41 @@ void onNtpSync(struct timeval* tv) {
   // Do NOT do HTTP here — this runs on the SNTP task, not loop().
 }
 
+bool isTimeValid() {
+  // Any date after 2023-11-14 means the clock was set (it boots at 1970).
+  return time(nullptr) > 1700000000;
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date (H. Hinnant's algorithm).
+static long daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const long era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (long)doe - 719468;
+}
+
+time_t parseHttpDate(const String& s) {
+  // "Wed, 23 Sep 2026 08:12:34 GMT"
+  int day = 0, year = 0, hh = 0, mm = 0, ss = 0;
+  char mon[4] = {0};
+  const char* p = strchr(s.c_str(), ',');
+  if (!p) return 0;
+  if (sscanf(p + 1, " %d %3s %d %d:%d:%d", &day, mon, &year, &hh, &mm, &ss) != 6) return 0;
+  static const char* kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  int month = 0;
+  for (int i = 0; i < 12; i++) {
+    if (strncmp(mon, kMonths[i], 3) == 0) { month = i + 1; break; }
+  }
+  if (month == 0 || day < 1 || day > 31 || year < 2020 || year > 2100 ||
+      hh > 23 || mm > 59 || ss > 60) {
+    return 0;
+  }
+  return (time_t)(daysFromCivil(year, month, day) * 86400L + hh * 3600L + mm * 60L + ss);
+}
+
 // ---------------------------------------------------------------------------
 // THE single writer to the STM32.
 // ---------------------------------------------------------------------------
@@ -161,29 +193,46 @@ void applyCurrentValue() {
   bool sched = false;
   const char* source = "setting";
 
-  // Read shared state under the mutex. Keep the critical section short: the
-  // only potentially slow call inside is getLocalTime() (<=10ms).
-  if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    return;  // couldn't get the lock this cycle; retry in intervalApply
+  // 0. Blacklist lock (absolute highest priority — server kill switch).
+  //    Overrides share/schedule/setting. Re-sent on the keepalive below so a
+  //    rebooted STM32 re-locks. deviceLocked/unlockPending are only touched on
+  //    Core 1 (MQTT callback + here), so no mutex is needed for them.
+  if (deviceLocked) {
+    out = "*LOCK12345#";
+    source = "lock";
+  } else if (unlockPending) {
+    // One-shot unlock pulse: emit *UNLOCK54321# once, then resume normal values
+    // on the next cycle (out differs from this, so it writes immediately).
+    unlockPending = false;
+    out = "*UNLOCK54321#";
+    source = "unlock";
   }
 
-  // 1. Share (highest) — only while fresh.
-  if (activeShareValue >= 0 && (millis() - activeShareAt) < (unsigned long)shareValidMs) {
-    out = buildShareValue(activeShareValue);
-    source = "share";
-  }
-  // 2. Schedule
   if (out.isEmpty()) {
-    out = currentScheduleValue();
-    if (!out.isEmpty()) { sched = true; source = "schedule"; }
-  }
-  // 3. Base setting
-  if (out.isEmpty()) {
-    out = lastSetupValue;
-  }
-  scheduleActive = sched;
+    // Read shared state under the mutex. Keep the critical section short: the
+    // only potentially slow call inside is getLocalTime() (<=10ms).
+    if (xSemaphoreTake(stateMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+      return;  // couldn't get the lock this cycle; retry in intervalApply
+    }
 
-  xSemaphoreGive(stateMutex);
+    // 1. Share (highest) — only while fresh.
+    if (activeShareValue >= 0 && (millis() - activeShareAt) < (unsigned long)shareValidMs) {
+      out = buildShareValue(activeShareValue);
+      source = "share";
+    }
+    // 2. Schedule
+    if (out.isEmpty()) {
+      out = currentScheduleValue();
+      if (!out.isEmpty()) { sched = true; source = "schedule"; }
+    }
+    // 3. Base setting
+    if (out.isEmpty()) {
+      out = lastSetupValue;
+    }
+    scheduleActive = sched;
+
+    xSemaphoreGive(stateMutex);
+  }
 
   if (out.isEmpty()) return;   // nothing known yet
 

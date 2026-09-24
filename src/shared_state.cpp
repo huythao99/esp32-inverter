@@ -7,7 +7,7 @@ QueueHandle_t     jobQueue       = nullptr;
 QueueHandle_t     otaStatusQueue = nullptr;
 
 // ---- Peripherals / clients ------------------------------------------------
-HardwareSerial          testSerial(2);  // UART2 for the STM32 link (UART0 is USB debug)
+HardwareSerial testSerial(2);   // UART2 for the STM32 link
 Preferences             preferences;
 WiFiClient              mqttWifiClient;
 PubSubClient            mqttClient(mqttWifiClient);
@@ -22,6 +22,8 @@ String MQTT_TOPIC_OTA_STATUS;
 String MQTT_TOPIC_CMD_SETTINGS;
 String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
+String MQTT_TOPIC_BLACKLIST;
+String MQTT_TOPIC_CMD_RESTART;
 
 // ---- Command sync flags ---------------------------------------------------
 volatile bool cmdSettingsPending = false;
@@ -43,11 +45,20 @@ const long    shareDebounceMs = 100;
 
 // ---- OTA trigger ----------------------------------------------------------
 volatile bool otaPending = false;
+volatile bool otaInProgress = false;
+
+// ---- Remote restart -------------------------------------------------------
+volatile bool restartPending = false;
+unsigned long restartAt = 0;
+
+// ---- Blacklist / device lock ----------------------------------------------
+volatile bool deviceLocked  = false;
+volatile bool unlockPending  = false;
 
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.0.11";
+String currentFirmwareVersion = "1.0.14";
 String param_ssid;
 String param_password;
 
@@ -75,6 +86,8 @@ String       lastSetupValue = "";
 bool         scheduleActive = false;
 
 // ---- NTP / time config ----------------------------------------------------
-const char* ntpServer = "time.google.com";
+const char* ntpServer  = "time.google.com";
+const char* ntpServer2 = "pool.ntp.org";
+const char* ntpServer3 = "216.239.35.0";   // time.google.com IP: fallback if DNS is blocked
 const long  gmtOffset_sec = 0;
 const int   daylightOffset_sec = 0;

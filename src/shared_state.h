@@ -62,7 +62,7 @@ extern QueueHandle_t     jobQueue;
 extern QueueHandle_t     otaStatusQueue;
 
 // ---- Peripherals / clients ------------------------------------------------
-extern HardwareSerial          testSerial;
+extern HardwareSerial          testSerial;   // UART2, STM32 link
 extern Preferences             preferences;
 extern WiFiClient              mqttWifiClient;
 extern PubSubClient            mqttClient;
@@ -77,6 +77,8 @@ extern String MQTT_TOPIC_OTA_STATUS;
 extern String MQTT_TOPIC_CMD_SETTINGS;
 extern String MQTT_TOPIC_CMD_SCHEDULE;
 extern String MQTT_TOPIC_SHARE;
+extern String MQTT_TOPIC_BLACKLIST;
+extern String MQTT_TOPIC_CMD_RESTART;
 
 // ---- Command sync flags (set in MQTT callback, drained in loop) -----------
 extern volatile bool  cmdSettingsPending;
@@ -97,6 +99,20 @@ extern const long     shareDebounceMs;  // own debounce (not cmdDebounce): small
 
 // ---- OTA trigger (set in MQTT callback) -----------------------------------
 extern volatile bool  otaPending;
+extern volatile bool  otaInProgress;   // set by the Core 0 worker while an OTA job runs
+
+// ---- Remote restart (set in MQTT callback, executed in loop) --------------
+extern volatile bool  restartPending;
+extern unsigned long  restartAt;
+
+// ---- Blacklist / device lock (server kill switch) -------------------------
+// Both written by the MQTT callback and read by applyCurrentValue(); both run
+// on Core 1, so a plain volatile bool is enough (no mutex needed).
+//   deviceLocked  : current lock intent from the server.
+//   unlockPending : set when a lock:false arrives while locked, so the next
+//                   applyCurrentValue() emits one *UNLOCK54321# pulse.
+extern volatile bool  deviceLocked;
+extern volatile bool  unlockPending;
 
 // ---- Identity / config ----------------------------------------------------
 extern String uid;
@@ -130,5 +146,7 @@ extern bool         scheduleActive;  // guarded by stateMutex
 
 // ---- NTP / time config ----------------------------------------------------
 extern const char* ntpServer;
+extern const char* ntpServer2;
+extern const char* ntpServer3;
 extern const long  gmtOffset_sec;
 extern const int   daylightOffset_sec;

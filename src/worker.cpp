@@ -61,7 +61,9 @@ static void workerTask(void* /*arg*/) {
         break;
 
       case JOB_OTA:
+        otaInProgress = true;    // blocks remote restart while flashing
         handleFirmwareUpdate();  // may ESP.restart() on success
+        otaInProgress = false;
         break;
 
       case JOB_LOG:
