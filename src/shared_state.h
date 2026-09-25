@@ -40,6 +40,7 @@ enum JobType : uint8_t {
   JOB_UPDATE_VERSION,
   JOB_OTA,
   JOB_LOG,
+  JOB_STM_OTA,     // flash the STM32 (stm_fota.cpp)
 };
 
 // Fixed-size buffers only: Strings must not be copied across the queue boundary
@@ -49,10 +50,17 @@ struct Job {
   char          code[24];      // JOB_LOG: error code
   char          message[100];  // JOB_LOG: error message
   unsigned long cooldownMs;    // JOB_LOG: rate-limit window
+  uint32_t      crc32;         // JOB_STM_OTA: expected CRC32 (0 = unknown); version in code[]
+  bool          force;         // JOB_STM_OTA: reflash same / unknown version
 };
 
 // ---- OTA status queue (Core 0 -> Core 1) ----------------------------------
+enum OtaTarget : uint8_t {
+  OTA_TARGET_ESP = 0,   // -> MQTT_TOPIC_OTA_STATUS
+  OTA_TARGET_STM = 1,   // -> MQTT_TOPIC_STM_OTA_STATUS
+};
 struct OtaStatusMsg {
+  uint8_t target;  // OtaTarget
   char json[192];  // ready-to-publish JSON payload
 };
 
@@ -79,6 +87,8 @@ extern String MQTT_TOPIC_CMD_SCHEDULE;
 extern String MQTT_TOPIC_SHARE;
 extern String MQTT_TOPIC_BLACKLIST;
 extern String MQTT_TOPIC_CMD_RESTART;
+extern String MQTT_TOPIC_STM_UPDATE;       // server -> device: flash the STM32
+extern String MQTT_TOPIC_STM_OTA_STATUS;   // device -> server: STM32 flash progress
 
 // ---- Command sync flags (set in MQTT callback, drained in loop) -----------
 extern volatile bool  cmdSettingsPending;
