@@ -398,6 +398,11 @@ void setup() {
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setKeepAlive(60);
   mqttClient.setSocketTimeout(8);  // bound connectToMqtt() well under the WDT
+  // PubSubClient drops any packet (topic + payload) larger than its buffer
+  // WITHOUT calling the callback. The default 256 B was too small for the
+  // old firmware/update payload (uid + deviceId + timestamps ~258 B), so OTA
+  // commands were silently lost. 512 B leaves room for every topic we use.
+  mqttClient.setBufferSize(512);
   setupMqttCallback();
   DBG_PRINT("MQTT Server: ");
   DBG_PRINT(MQTT_SERVER);

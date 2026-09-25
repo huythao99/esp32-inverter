@@ -77,8 +77,23 @@ void setupMqttCallback() {
     DBG_PRINTLN(message);
 
     // Firmware update: hand off to Core 0 so the callback returns immediately.
+    // Payload is {"ts":<epoch ms>}; a command older than 2 minutes is ignored
+    // (redelivered / stale). No ts (older apps) or clock not set yet -> accept.
     if (topicStr == MQTT_TOPIC_FIRMWARE) {
-      otaPending = true;
+      bool accept = true;
+      if (isTimeValid()) {
+        JsonDocument doc;
+        if (deserializeJson(doc, message) == DeserializationError::Ok &&
+            doc["ts"].is<double>()) {
+          double ageMs = (double)time(nullptr) * 1000.0 - doc["ts"].as<double>();
+          if (ageMs > 120000.0) accept = false;
+        }
+      }
+      if (accept) {
+        otaPending = true;
+      } else {
+        trackLog("FOTA_STALE", "Ignored stale firmware/update command", 60000);
+      }
     }
     // Command topics: payload is just "{}" - react to the topic name only.
     else if (topicStr.endsWith("/cmd/settings")) {
