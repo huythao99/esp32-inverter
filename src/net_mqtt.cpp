@@ -4,6 +4,7 @@
 #include "storage.h"
 #include "worker.h"
 #include "logic.h"
+#include "stm_fota.h"
 #include <ArduinoJson.h>
 #include "time.h"
 
@@ -30,6 +31,8 @@ bool connectToMqtt() {
       MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
       MQTT_TOPIC_BLACKLIST    = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/blacklist";
       MQTT_TOPIC_CMD_RESTART  = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/restart";
+      MQTT_TOPIC_STM_UPDATE     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/stm/update";
+      MQTT_TOPIC_STM_OTA_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/stm/ota/status";
 
       // Only subscribe to server->device control topics. Do NOT subscribe to
       // STATUS / DATA: the device publishes those itself, so subscribing echoes
@@ -43,6 +46,7 @@ bool connectToMqtt() {
       mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_BLACKLIST.c_str(), 1);     // QoS 1: lock must not be missed
       mqttClient.subscribe(MQTT_TOPIC_CMD_RESTART.c_str(), 1);   // QoS 1, never retained
+      mqttClient.subscribe(MQTT_TOPIC_STM_UPDATE.c_str());       // QoS 0, never retained
 
       DBG_PRINT("Subscribed cmd/settings: [");
       DBG_PRINT(MQTT_TOPIC_CMD_SETTINGS);
@@ -94,6 +98,10 @@ void setupMqttCallback() {
       } else {
         trackLog("FOTA_STALE", "Ignored stale firmware/update command", 60000);
       }
+    }
+    // STM32 firmware update: parse here, enqueue from loop (stmFotaLoopTick).
+    else if (topicStr == MQTT_TOPIC_STM_UPDATE) {
+      stmFotaOnTrigger(message);
     }
     // Command topics: payload is just "{}" - react to the topic name only.
     else if (topicStr.endsWith("/cmd/settings")) {
@@ -163,8 +171,10 @@ void drainOtaStatus() {
   if (!otaStatusQueue) return;
   OtaStatusMsg msg;
   while (xQueueReceive(otaStatusQueue, &msg, 0) == pdTRUE) {
-    if (mqttClient.connected() && !MQTT_TOPIC_OTA_STATUS.isEmpty()) {
-      bool published = mqttClient.publish(MQTT_TOPIC_OTA_STATUS.c_str(), msg.json);
+    const String& topic = (msg.target == OTA_TARGET_STM) ? MQTT_TOPIC_STM_OTA_STATUS
+                                                         : MQTT_TOPIC_OTA_STATUS;
+    if (mqttClient.connected() && !topic.isEmpty()) {
+      bool published = mqttClient.publish(topic.c_str(), msg.json);
       DBG_PRINT("MQTT OTA status published: ");
       DBG_PRINTLN(published ? "Success" : "Failed");
     }

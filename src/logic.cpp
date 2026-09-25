@@ -1,4 +1,5 @@
 #include "logic.h"
+#include "stm_fota.h"
 #include "shared_state.h"
 #include "config.h"
 #include "worker.h"   // trackLog() (enqueues; non-blocking)
@@ -189,6 +190,11 @@ static const long   kApplyKeepaliveMs = 3000;   // re-send same value at least t
 static const char*  s_lastLoggedSource = "";
 
 void applyCurrentValue() {
+  // The Core 0 worker owns the UART while it flashes the STM32 (stm_fota.h).
+  // Nothing may be written then; the keepalive below re-sends the value within
+  // kApplyKeepaliveMs once the UART is back.
+  if (stmUartRequest) return;
+
   String out;
   bool sched = false;
   const char* source = "setting";
