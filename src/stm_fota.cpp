@@ -5,6 +5,7 @@
 #include "logic.h"
 #include "worker.h"
 #include "gti_fota.h"
+#include "ca_certs.h"
 #include <LittleFS.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
@@ -205,7 +206,7 @@ static String deviceQuery() {
 // GET /api/stm-firmware -> target image. Returns the HTTP code (<0 = no connection).
 static int fetchTarget(StmTarget& t) {
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(kRootCA);   // verify the server (ca_certs.h)
   HTTPClient http;
   http.setReuse(false);
   http.setTimeout(10000);
@@ -228,7 +229,7 @@ static int fetchTarget(StmTarget& t) {
 // Download t.url to kNewImage, checking size and CRC32 on the way.
 static bool downloadImage(const StmTarget& t, String& err) {
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(kRootCA);   // verify the server (ca_certs.h)
   client.setHandshakeTimeout(30);
   HTTPClient http;
   http.setReuse(false);
@@ -298,7 +299,7 @@ static bool downloadImage(const StmTarget& t, String& err) {
 // PATCH /api/stm-firmware/info/{uid}/{id} after a successful update.
 static void reportVersion(const String& version, uint32_t crc) {
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(kRootCA);   // verify the server (ca_certs.h)
   HTTPClient http;
   http.setReuse(false);
   http.setTimeout(10000);

@@ -17,7 +17,7 @@
   #define DBG_PRINTLN(...) do {} while (0)
 #endif
 
-#define WIFI_BROADCAST_SSID "GTIControl1375"
+#define WIFI_BROADCAST_SSID "GTIControl1369"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -32,7 +32,17 @@
 
 // MQTT Configuration
 #define MQTT_SERVER "giabao-inverter.com"
-#define MQTT_PORT 1883
+#define MQTT_PORT 1883        // plain (legacy / fallback)
+#define MQTT_TLS_PORT 8883    // TLS, server cert verified against ca_certs.h
+// 1 = connect over TLS (8883). 0 = plain 1883 only.
+#define MQTT_USE_TLS 1
+// Transition safety net: after MQTT_TLS_MAX_FAILS consecutive TLS failures
+// (broker without 8883, cert problem...) fall back to plain 1883 so the device
+// stays online, and try TLS again after MQTT_TLS_RETRY_MS. Set to 0 once every
+// broker serves 8883: a fallback can be forced by an attacker blocking 8883.
+#define MQTT_TLS_FALLBACK_PLAIN 1
+#define MQTT_TLS_MAX_FAILS 3
+#define MQTT_TLS_RETRY_MS 3600000UL   // 1 h
 #define MQTT_USERNAME "giabao"
 #define MQTT_PASSWORD "0918273645"
 

@@ -7,16 +7,59 @@
 #include "stm_fota.h"
 #include <ArduinoJson.h>
 #include "time.h"
+#include "esp_task_wdt.h"
+
+// ---- MQTT transport (TLS with plain fallback, see config.h) ---------------
+static uint8_t       s_tlsFails = 0;          // consecutive TLS connect failures
+static bool          s_plainFallback = false; // currently using plain 1883
+static unsigned long s_fallbackAt = 0;
+
+// TLS unless we fell back to plain less than MQTT_TLS_RETRY_MS ago.
+static bool useTlsNow() {
+#if MQTT_USE_TLS
+  if (s_plainFallback && millis() - s_fallbackAt >= MQTT_TLS_RETRY_MS) {
+    s_plainFallback = false;   // time to try TLS again
+    s_tlsFails = 0;
+  }
+  return !s_plainFallback;
+#else
+  return false;
+#endif
+}
 
 bool connectToMqtt() {
   lastMqttReconnectAttempt = millis();
 
   String clientId = "esp32-" + WiFi.macAddress();
 
-  if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
+  const bool tls = useTlsNow();
+  bool transportOk = true;
+  if (tls) {
+    mqttClient.setClient(mqttTlsClient);
+    mqttClient.setServer(MQTT_SERVER, MQTT_TLS_PORT);
+    // Open the TLS socket ourselves with a short TCP timeout (the default is
+    // 30 s, longer than the 20 s loop watchdog), then feed the watchdog before
+    // PubSubClient sends CONNECT (it reuses an already-connected client).
+    // Worst case: 5 s TCP + 8 s handshake, then <= 8 s for CONNACK.
+    mqttTlsClient.stop();
+    transportOk = mqttTlsClient.connect(MQTT_SERVER, MQTT_TLS_PORT, 5000) == 1;
+    esp_task_wdt_reset();
+  } else {
+    mqttClient.setClient(mqttWifiClient);
+    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  }
+
+  if (transportOk &&
+      mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
     isMqttConnected = true;
     connectMqtt = 1;
     mqttFailCount = 0;
+    if (tls) s_tlsFails = 0;
+    static bool s_transportLogged = false;
+    if (!s_transportLogged) {
+      s_transportLogged = true;
+      trackLog("MQTT_TRANSPORT", tls ? "tls:8883" : "plain:1883 (TLS fallback)", 0);
+    }
 
     String currentUid = getUid();
     if (!currentUid.isEmpty()) {
@@ -61,6 +104,18 @@ bool connectToMqtt() {
   isMqttConnected = false;
   connectMqtt = 0;
   mqttFailCount++;
+#if MQTT_USE_TLS && MQTT_TLS_FALLBACK_PLAIN
+  if (tls && ++s_tlsFails >= MQTT_TLS_MAX_FAILS) {
+    // Broker unreachable over TLS: stay online over plain MQTT for now.
+    s_plainFallback = true;
+    s_fallbackAt = millis();
+    s_tlsFails = 0;
+    trackLog("MQTT_TLS_FALLBACK",
+             "TLS connect failed " + String(MQTT_TLS_MAX_FAILS) +
+                 "x (state " + String(mqttClient.state()) + "), using plain 1883",
+             600000);
+  }
+#endif
   DBG_PRINT("MQTT connection failed, fail count: ");
   DBG_PRINTLN(mqttFailCount);
   return false;

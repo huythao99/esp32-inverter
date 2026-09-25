@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <HardwareSerial.h>
@@ -72,7 +73,8 @@ extern QueueHandle_t     otaStatusQueue;
 // ---- Peripherals / clients ------------------------------------------------
 extern HardwareSerial          testSerial;   // UART2, STM32 link
 extern Preferences             preferences;
-extern WiFiClient              mqttWifiClient;
+extern WiFiClient              mqttWifiClient;   // plain 1883 (fallback)
+extern WiFiClientSecure        mqttTlsClient;    // TLS 8883
 extern PubSubClient            mqttClient;
 
 // ---- MQTT topics (built on connect, Core 1) -------------------------------

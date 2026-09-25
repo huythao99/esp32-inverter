@@ -17,6 +17,7 @@
 #include "ota_health.h"
 #include "wifi_page.h"
 #include "stm_fota.h"
+#include "ca_certs.h"
 
 // Task Watchdog timeout for the loop (Core 1). Must exceed the longest legitimate
 // blocking section on Core 1 (MQTT connect bounded to 8s, WiFi scan ~1.5s, AP mode
@@ -75,6 +76,10 @@ bool scanRequested = false;
 
 // Setup-page connect attempt result: -1 in progress, 0 failed, 1 success.
 int wifiConnectResult = -1;
+// Why the last STA attempt dropped (wifi_err_reason_t, 0 = none), shown by the
+// setup page: 15/202/204/2 wrong password, 201 network not found, 200/203
+// weak signal. 8 (ASSOC_LEAVE) is our own WiFi.disconnect() and is ignored.
+static volatile uint8_t staDisconnectReason = 0;
 unsigned long connectAttemptStart = 0;
 const long connectTimeout = 15000;
 
@@ -431,7 +436,10 @@ void setup() {
   netHttpInit();
 
   // MQTT init
-  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  // Server/port + transport (TLS 8883 or plain 1883) are chosen on every
+  // connect attempt in connectToMqtt().
+  mqttTlsClient.setCACert(kRootCA);
+  mqttTlsClient.setHandshakeTimeout(8);   // s; keeps connect well under the WDT
   mqttClient.setKeepAlive(60);
   mqttClient.setSocketTimeout(8);  // bound connectToMqtt() well under the WDT
   // PubSubClient drops any packet (topic + payload) larger than its buffer
@@ -458,6 +466,12 @@ void setup() {
   // Detect a freshly-OTA'd image still awaiting health confirmation.
   otaHealthBegin();
 
+  // Remember why a setup connect attempt failed (reported by /connect-status).
+  WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t info) {
+    uint8_t r = info.wifi_sta_disconnected.reason;
+    if (r != WIFI_REASON_ASSOC_LEAVE) staDisconnectReason = r;
+  }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
   // ---- Web routes ----
   server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request){
     request->send(200, "text/html", index_html);   // PROGMEM page, sent from flash
@@ -480,6 +494,12 @@ void setup() {
       param_password = request->getParam(PARAM_INPUT_2)->value();
       uid = request->getParam(PARAM_INPUT_3)->value();
       isStartConnect = true;
+      // Reset the reported state NOW (not in loop()): the page polls
+      // /connect-status right after this reply and must not see the previous
+      // attempt's result.
+      wifiConnectResult = -1;
+      connectMqtt = -1;
+      staDisconnectReason = 0;
       lastScanRequest = 0;
       WiFi.disconnect();
       request->send(200, "text/plain", connectSuccess());
@@ -502,7 +522,12 @@ void setup() {
   server.on("/connect-status", HTTP_GET, [](AsyncWebServerRequest *request) {
     String json = "{\"wifi\":" + String((int)WiFi.status()) +
                   ",\"mqtt\":" + String(connectMqtt) +
-                  ",\"result\":" + String(wifiConnectResult) + "}";
+                  ",\"result\":" + String(wifiConnectResult) +
+                  // busy: a connect attempt is queued / running.
+                  ",\"busy\":" + String(((isStartConnect && !param_ssid.isEmpty()) ||
+                                          connectAttemptStart != 0) ? 1 : 0) +
+                  ",\"reason\":" + String((int)staDisconnectReason) +
+                  ",\"ssid\":\"" + jsonEscape(param_ssid) + "\"" + "}";
     request->send(200, "application/json", json);
   });
 
@@ -673,6 +698,7 @@ void loop() {
     WiFi.setAutoReconnect(false);
     WiFi.begin(param_ssid.c_str(), param_password.c_str());
     WiFi.mode(WIFI_AP_STA);
+    staDisconnectReason = 0;
     isStartConnect = false;
     isStartMqtt = true;
     wifiConnectResult = -1;

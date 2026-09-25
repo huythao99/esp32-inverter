@@ -3,6 +3,7 @@
 #include "config.h"
 #include "storage.h"
 #include "logic.h"
+#include "ca_certs.h"
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <WiFiClientSecure.h>
@@ -10,8 +11,12 @@
 #include "time.h"
 #include <sys/time.h>
 
-// Shared HTTPClient — Core 0 only.
+// Shared HTTPClient — Core 0 only. All API calls go over TLS through one
+// WiFiClientSecure that verifies the server certificate against the pinned
+// root CAs (ca_certs.h). A plain http.begin(url) would create an unverified
+// TLS client, so a fake server (DNS spoofing, rogue router) could answer.
 static HTTPClient http;
+static WiFiClientSecure s_tls;
 
 // Response headers we want HTTPClient to keep. `Date` is the fallback clock
 // source when NTP (UDP 123) is blocked by the router/ISP.
@@ -19,7 +24,7 @@ static const char* kCollectHeaders[] = {"Date"};
 
 // http.begin() + ask HTTPClient to keep the Date header of the response.
 static void beginJson(const String& url) {
-  http.begin(url);
+  http.begin(s_tls, url);
   http.collectHeaders(kCollectHeaders, 1);
   http.addHeader("Content-Type", "application/json");
 }
@@ -42,6 +47,8 @@ void netHttpInit() {
   // idle keep-alive connection and reuse then fails with a TLS reset (ssl_client
   // -76). A fresh connection per request avoids that.
   http.setReuse(false);
+  s_tls.setCACert(kRootCA);
+  s_tls.setHandshakeTimeout(15);   // seconds
   http.setTimeout(3000);  // 3s timeout to bound blocking on Core 0
 }
 
@@ -214,8 +221,10 @@ bool performFOTAUpdate(const String& firmwareURL) {
     publishOTAStatus("failed", "Firmware update error: " + String(err));
   });
 
+  // Verify the firmware server's certificate: an unverified download would
+  // let anyone who can redirect the traffic install their own firmware.
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(kRootCA);
   client.setHandshakeTimeout(30);   // seconds — allow a slow TLS handshake
 
   t_httpUpdate_return ret = httpUpdate.update(client, firmwareURL);

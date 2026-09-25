@@ -10,6 +10,7 @@ QueueHandle_t     otaStatusQueue = nullptr;
 HardwareSerial testSerial(2);   // UART2 for the STM32 link
 Preferences             preferences;
 WiFiClient              mqttWifiClient;
+WiFiClientSecure        mqttTlsClient;
 PubSubClient            mqttClient(mqttWifiClient);
 
 // ---- MQTT topics ----------------------------------------------------------
@@ -60,7 +61,7 @@ volatile bool unlockPending  = false;
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.0.18";
+String currentFirmwareVersion = "1.0.15";
 String param_ssid;
 String param_password;
 
