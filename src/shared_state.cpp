@@ -24,6 +24,8 @@ String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
 String MQTT_TOPIC_BLACKLIST;
 String MQTT_TOPIC_CMD_RESTART;
+String MQTT_TOPIC_STM_UPDATE;
+String MQTT_TOPIC_STM_OTA_STATUS;
 
 // ---- Command sync flags ---------------------------------------------------
 volatile bool cmdSettingsPending = false;
@@ -58,7 +60,7 @@ volatile bool unlockPending  = false;
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.0.14";
+String currentFirmwareVersion = "1.0.18";
 String param_ssid;
 String param_password;
 

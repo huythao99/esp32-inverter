@@ -118,6 +118,7 @@ void publishOTAStatus(const String& status, const String& message, int progress)
   // Hand to Core 1 for the actual mqttClient.publish (keeps MQTT single-threaded).
   if (otaStatusQueue) {
     OtaStatusMsg msg;
+    msg.target = OTA_TARGET_ESP;
     strncpy(msg.json, jsonStatus.c_str(), sizeof(msg.json) - 1);
     msg.json[sizeof(msg.json) - 1] = '\0';
     xQueueSend(otaStatusQueue, &msg, 0);

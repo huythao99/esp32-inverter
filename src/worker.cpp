@@ -3,15 +3,14 @@
 #include "config.h"
 #include "storage.h"
 #include "net_http.h"
+#include "stm_fota.h"
 
 static TaskHandle_t s_workerTask = nullptr;
 
 // Push a job without blocking Core 1. Drop if the queue is full (jobs are either
 // idempotent re-fetches or best-effort logs).
-static void enqueue(const Job& job) {
-  if (jobQueue) {
-    xQueueSend(jobQueue, &job, 0);
-  }
+static bool enqueue(const Job& job) {
+  return jobQueue && xQueueSend(jobQueue, &job, 0) == pdTRUE;
 }
 
 void requestFetchSettings() { Job j = {}; j.type = JOB_FETCH_SETTINGS; enqueue(j); }
@@ -19,6 +18,15 @@ void requestFetchSchedule() { Job j = {}; j.type = JOB_FETCH_SCHEDULE; enqueue(j
 void requestRegister()      { Job j = {}; j.type = JOB_REGISTER;       enqueue(j); }
 void requestUpdateVersion() { Job j = {}; j.type = JOB_UPDATE_VERSION; enqueue(j); }
 void requestOTA()           { Job j = {}; j.type = JOB_OTA;            enqueue(j); }
+
+bool requestStmOta(const char* version, uint32_t crc32, bool force) {
+  Job j = {};
+  j.type = JOB_STM_OTA;
+  strncpy(j.code, version ? version : "", sizeof(j.code) - 1);
+  j.crc32 = crc32;
+  j.force = force;
+  return enqueue(j);
+}
 
 bool trackLog(const String& code, const String& message, unsigned long cooldownMs) {
   Job j = {};
@@ -68,6 +76,10 @@ static void workerTask(void* /*arg*/) {
 
       case JOB_LOG:
         trackLogRL(String(job.code), String(job.message), job.cooldownMs);
+        break;
+
+      case JOB_STM_OTA:
+        stmFotaRun(job.code, job.crc32, job.force);   // ~40-60 s
         break;
     }
   }

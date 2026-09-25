@@ -16,6 +16,7 @@
 #include "worker.h"
 #include "ota_health.h"
 #include "wifi_page.h"
+#include "stm_fota.h"
 
 // Task Watchdog timeout for the loop (Core 1). Must exceed the longest legitimate
 // blocking section on Core 1 (MQTT connect bounded to 8s, WiFi scan ~1.5s, AP mode
@@ -99,8 +100,8 @@ enum UartCounter : uint8_t {
   UC_HW_FIFO_OVF,   // hardware FIFO overflow
   UC_HW_BUF_FULL,   // RX ring buffer full (loop() blocked too long)
   UC_DROP_HWERR,    // frames dropped: HW error / RX overflow hit them
-  UC_BAD_FIELDS,    // field count not 10/12
-  UC_BAD_NUMBER,    // a field is not a plain number
+  UC_BAD_FIELDS,    // field count not 10/12/13
+  UC_BAD_NUMBER,    // a field is not a plain number (13th: not x.y.z)
   UC_BAD_CHAR,      // frame contained a non-printable byte
   UC_TOO_LONG,      // no terminator within 256 bytes
   UC_COUNT
@@ -180,6 +181,23 @@ static void rejectFrame(UartCounter reason, const String& frame) {
 // fields (a 12-field frame minus its first two), so once the count is known a
 // different count is rejected — unless it repeats kFieldRelearnRun times in a
 // row (the STM32 firmware really changed).
+// Frame layouts: 10 fields, 12 fields (odometers), or 12 + 13th field = STM32
+// firmware version "x.y.z" (STM32 firmware >= 2.0.0). 12 and 13 share one
+// layout for the learned count below, so an STM32 FOTA that adds the version
+// field doesn't trigger a relearn.
+static bool isVersionField(const String& f) {
+  int dots = 0;
+  bool digit = false;
+  for (unsigned int i = 0; i < f.length(); i++) {
+    char c = f[i];
+    if (c >= '0' && c <= '9') { digit = true; continue; }
+    if (c != '.' || !digit) return false;   // no leading / double dots
+    dots++;
+    digit = false;
+  }
+  return dots == 2 && digit;               // exactly x.y.z, no trailing dot
+}
+
 static int s_expectedFields = 0;       // 0 = not learned yet
 static int s_otherFields = 0;
 static int s_otherFieldsRun = 0;
@@ -189,6 +207,7 @@ static const int kFieldRelearnRun = 5;
 // Rejected frames are counted for UART_STATS and one escaped sample is kept
 // for STM32_BAD_FRAME. A frame that passes here contains only digits, '.',
 // '+', '-', '#' and an optional leading '$', so it is also JSON-safe.
+// Accepted: 10 or 12 numeric fields, or 12 numeric + a 13th "x.y.z" version.
 static bool acceptFrame(const String& frame, bool hwError) {
   if (hwError) { rejectFrame(UC_DROP_HWERR, frame); return false; }
 
@@ -201,36 +220,53 @@ static bool acceptFrame(const String& frame, bool hwError) {
     if (b < 0x20 || b > 0x7E) { badChar = true; break; }
   }
   // Same field split the backend uses; a trailing '#' adds no empty field.
+  // Fields 1..12 must be plain numbers; a 13th field must be a version x.y.z.
   int start = 0;
+  bool versionOk = true;
   while (start < len) {
     int end = frame.indexOf('#', start);
     if (end == -1) end = len;
-    if (allNumeric && !isNumericField(frame.substring(start, end), fields == 0)) {
-      allNumeric = false;
+    String f = frame.substring(start, end);
+    if (fields < 12) {
+      if (allNumeric && !isNumericField(f, fields == 0)) allNumeric = false;
+    } else if (fields == 12) {
+      versionOk = isVersionField(f);
     }
     fields++;
     start = end + 1;
   }
 
-  if (badChar)                           { rejectFrame(UC_BAD_CHAR, frame);   return false; }
-  if (fields != 10 && fields != 12)      { rejectFrame(UC_BAD_FIELDS, frame); return false; }
-  if (!allNumeric)                       { rejectFrame(UC_BAD_NUMBER, frame); return false; }
+  if (badChar)                                  { rejectFrame(UC_BAD_CHAR, frame);   return false; }
+  if (fields != 10 && fields != 12 && fields != 13) { rejectFrame(UC_BAD_FIELDS, frame); return false; }
+  if (!allNumeric || !versionOk)                { rejectFrame(UC_BAD_NUMBER, frame); return false; }
 
-  if (s_expectedFields == 0 || fields == s_expectedFields) {
-    s_expectedFields = fields;
+  // 12 and 13 fields are the same layout (13 = 12 + version).
+  const int layout = (fields == 10) ? 10 : 12;
+  if (s_expectedFields == 0 || layout == s_expectedFields) {
+    s_expectedFields = layout;
     s_otherFieldsRun = 0;
   } else {
-    s_otherFieldsRun = (fields == s_otherFields) ? s_otherFieldsRun + 1 : 1;
-    s_otherFields = fields;
+    s_otherFieldsRun = (layout == s_otherFields) ? s_otherFieldsRun + 1 : 1;
+    s_otherFields = layout;
     if (s_otherFieldsRun < kFieldRelearnRun) {
       rejectFrame(UC_BAD_FIELDS, frame);
       return false;
     }
-    s_expectedFields = fields;           // consistent new format: adopt it
+    s_expectedFields = layout;           // consistent new format: adopt it
     s_otherFieldsRun = 0;
   }
   uartCount(UC_OK);
   return true;
+}
+
+// Remember the STM32 firmware version from a 13-field frame (last field x.y.z).
+static void recordStmVersion(const String& frame) {
+  int end = frame.length();
+  if (end > 0 && frame[end - 1] == '#') end--;          // trailing '#'
+  const int start = frame.lastIndexOf('#', end - 1) + 1;
+  if (start <= 0) return;
+  const String last = frame.substring(start, end);
+  if (isVersionField(last)) stmSetReportedVersion(last);
 }
 
 // ---------------------------------------------------------------------------
@@ -492,7 +528,22 @@ void loop() {
   // the head of another. Drop the whole backlog and resync on a terminator.
   // (Loses a few seconds of frames; overflow only happens while loop() was
   // blocked, e.g. in a failing MQTT reconnect when nothing is published anyway.)
-  if (s_uartOverflow) {
+  // STM32 FOTA: the Core 0 worker asked for the UART. Stop touching it
+  // (no reads here, applyCurrentValue() writes nothing) and confirm. When it is
+  // handed back, drop whatever is buffered and resync on the next terminator.
+  const bool stmUartBusy = stmUartRequest;
+  if (stmUartBusy) {
+    if (!stmUartReleased) {
+      stmMsgBuffer = "";
+      stmLatestFrame = "";
+      stmUartReleased = true;
+    }
+  } else if (stmUartReleased) {
+    stmUartReleased = false;
+    s_uartOverflow = true;          // reuse the resync path below
+  }
+
+  if (!stmUartBusy && s_uartOverflow) {
     s_uartOverflow = false;
     while (testSerial.available()) testSerial.read();
     if (stmMsgBuffer.length() > 0) rejectFrame(UC_DROP_HWERR, stmMsgBuffer);
@@ -501,7 +552,7 @@ void loop() {
     stmSkipToTerminator = true;
   }
 
-  while (testSerial.available()) {
+  while (!stmUartBusy && testSerial.available()) {
     char c = (char)testSerial.read();
     if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
       // A HW receive error (bit error / break) happened while this frame was
@@ -515,6 +566,7 @@ void loop() {
         frame.trim();
         if (acceptFrame(frame, hwError)) {
           stmLatestFrame = frame;        // keep only the most recent valid frame
+          recordStmVersion(frame);       // field 13 (STM32 firmware >= 2.0.0)
           DBG_PRINT("[STM32] ");
           DBG_PRINTLN(frame);
         } else {
@@ -563,6 +615,7 @@ void loop() {
     otaPending = false;
     requestOTA();
   }
+  stmFotaLoopTick();   // STM32 FOTA trigger (stm/update) -> Core 0
 
   // Remote restart requested over MQTT (cmd/restart). Wait a moment so the
   // QoS 1 PUBACK actually leaves the socket (no redelivery after boot), and

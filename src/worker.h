@@ -16,6 +16,8 @@ void requestFetchSchedule();
 void requestRegister();
 void requestUpdateVersion();
 void requestOTA();
+// Flash the STM32 (see stm_fota.h). false if the job queue is full.
+bool requestStmOta(const char* version, uint32_t crc32, bool force);
 
 // Rate-limited error log — enqueues a JOB_LOG so the HTTP POST runs on Core 0.
 // Safe to call from any core / the MQTT callback.
