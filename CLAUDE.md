@@ -104,4 +104,15 @@ RTOS handles + `Job`/`ScheduleItem`) · `storage.*` (EEPROM + NVS + `getUid`) ·
   on every run** — commit/stash first.
 - Each unit's WiFi AP SSID (`GTIControl<N>`) is persisted to NVS on first boot and
   then never changes, even across firmware uploads.
+- **Keep the STM32 debug-frame compatibility (`convertDebugFrame()` in
+  `main.cpp`).** Some boards in the field (first seen: GTIControl1218) run a
+  test STM32 build that cannot be reflashed. It sends every 10 s
+  `energy_import_wh <Wh>#<10 fields>*` then `energy_gen_wh <Wh>#*`; the ESP
+  merges them into the standard 12-field frame `<10 fields>#<gen>#<import>`.
+  Never publish the 10-field part alone (the backend would add its last two
+  numbers to the daily energy). Devices using it send `STM_DEBUG_COMPAT` once
+  per boot. Do not send STM32 FOTA to these boards.
+- **`cmd/uart-debug`** `{"minutes":N}` streams every raw STM32 line to
+  `.../debug/uart` for N minutes (1-30) — use it before guessing about a board
+  whose `UART_STATS` shows `ok=0`.
 ```

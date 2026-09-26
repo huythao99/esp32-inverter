@@ -89,6 +89,8 @@ extern String MQTT_TOPIC_CMD_SCHEDULE;
 extern String MQTT_TOPIC_SHARE;
 extern String MQTT_TOPIC_BLACKLIST;
 extern String MQTT_TOPIC_CMD_RESTART;
+extern String MQTT_TOPIC_CMD_UART_DEBUG;   // server -> device: {"minutes":N}
+extern String MQTT_TOPIC_DEBUG_UART;       // device -> server: raw STM32 lines
 extern String MQTT_TOPIC_STM_UPDATE;       // server -> device: flash the STM32
 extern String MQTT_TOPIC_STM_OTA_STATUS;   // device -> server: STM32 flash progress
 
@@ -116,6 +118,11 @@ extern volatile bool  otaInProgress;   // set by the Core 0 worker while an OTA 
 // ---- Remote restart (set in MQTT callback, executed in loop) --------------
 extern volatile bool  restartPending;
 extern unsigned long  restartAt;
+
+// UART diagnostics (cmd/uart-debug): while millis() < uartDebugUntil every
+// line received from the STM32 (valid or rejected) is also published raw on
+// MQTT_TOPIC_DEBUG_UART. 0 = off. Set by the MQTT callback, read by loop().
+extern volatile unsigned long uartDebugUntil;
 
 // ---- Blacklist / device lock (server kill switch) -------------------------
 // Both written by the MQTT callback and read by applyCurrentValue(); both run

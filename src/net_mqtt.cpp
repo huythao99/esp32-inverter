@@ -74,6 +74,8 @@ bool connectToMqtt() {
       MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
       MQTT_TOPIC_BLACKLIST    = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/blacklist";
       MQTT_TOPIC_CMD_RESTART  = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/restart";
+      MQTT_TOPIC_CMD_UART_DEBUG = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/uart-debug";
+      MQTT_TOPIC_DEBUG_UART     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/debug/uart";
       MQTT_TOPIC_STM_UPDATE     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/stm/update";
       MQTT_TOPIC_STM_OTA_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/stm/ota/status";
 
@@ -89,6 +91,7 @@ bool connectToMqtt() {
       mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_BLACKLIST.c_str(), 1);     // QoS 1: lock must not be missed
       mqttClient.subscribe(MQTT_TOPIC_CMD_RESTART.c_str(), 1);   // QoS 1, never retained
+      mqttClient.subscribe(MQTT_TOPIC_CMD_UART_DEBUG.c_str(), 1); // QoS 1, never retained
       mqttClient.subscribe(MQTT_TOPIC_STM_UPDATE.c_str());       // QoS 0, never retained
 
       DBG_PRINT("Subscribed cmd/settings: [");
@@ -190,6 +193,29 @@ void setupMqttCallback() {
       }
       DBG_PRINT("[RESTART] command ");
       DBG_PRINTLN(accept ? "accepted" : "ignored (stale / just booted)");
+    }
+    // UART diagnostics: {"minutes":N} (1..30, default 5; 0 = stop), optional
+    // "ts" (epoch ms, ignored when older than 2 min). While active, loop()
+    // publishes every raw STM32 line on .../debug/uart (see main.cpp).
+    else if (topicStr == MQTT_TOPIC_CMD_UART_DEBUG) {
+      long minutes = 5;
+      bool accept = true;
+      JsonDocument doc;
+      if (deserializeJson(doc, message) == DeserializationError::Ok) {
+        if (doc["minutes"].is<long>()) minutes = doc["minutes"].as<long>();
+        if (isTimeValid() && doc["ts"].is<double>()) {
+          double ageMs = (double)time(nullptr) * 1000.0 - doc["ts"].as<double>();
+          if (ageMs > 120000.0) accept = false;
+        }
+      }
+      if (minutes < 0) minutes = 0;
+      if (minutes > 30) minutes = 30;
+      if (accept) {
+        unsigned long until = millis() + (unsigned long)minutes * 60000UL;
+        uartDebugUntil = minutes == 0 ? 0 : (until == 0 ? 1 : until);
+      }
+      DBG_PRINT("[UART-DEBUG] ");
+      DBG_PRINTLN(accept ? String(minutes) + " min" : String("ignored (stale)"));
     }
     // Share topic: payload is {"value":N}. Parse now, apply from loop().
     else if (topicStr.endsWith("/share")) {

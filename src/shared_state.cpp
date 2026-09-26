@@ -25,6 +25,8 @@ String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
 String MQTT_TOPIC_BLACKLIST;
 String MQTT_TOPIC_CMD_RESTART;
+String MQTT_TOPIC_CMD_UART_DEBUG;
+String MQTT_TOPIC_DEBUG_UART;
 String MQTT_TOPIC_STM_UPDATE;
 String MQTT_TOPIC_STM_OTA_STATUS;
 
@@ -53,6 +55,7 @@ volatile bool otaInProgress = false;
 // ---- Remote restart -------------------------------------------------------
 volatile bool restartPending = false;
 unsigned long restartAt = 0;
+volatile unsigned long uartDebugUntil = 0;
 
 // ---- Blacklist / device lock ----------------------------------------------
 volatile bool deviceLocked  = false;
@@ -61,7 +64,7 @@ volatile bool unlockPending  = false;
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.0.15";
+String currentFirmwareVersion = "1.0.17";
 String param_ssid;
 String param_password;
 

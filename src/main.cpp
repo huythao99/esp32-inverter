@@ -264,6 +264,153 @@ static bool acceptFrame(const String& frame, bool hwError) {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// UART diagnostics (cmd/uart-debug, see net_mqtt.cpp). Lines received while
+// active are queued here from the UART drain and published after it, so the
+// drain itself never blocks on MQTT. At most kDbgMaxPerSec lines per second
+// are published; the rest are counted as dropped.
+// ---------------------------------------------------------------------------
+static const int kDbgQueue = 16;
+static const int kDbgMaxPerSec = 10;
+static const unsigned kDbgMaxChars = 200;   // per line in the JSON (buffer 512 B)
+struct DbgLine { String text; char kind; char term; };  // kind: a=accepted r=rejected l=too long
+static DbgLine s_dbgQ[kDbgQueue];
+static int s_dbgLen = 0;
+static unsigned long s_dbgSeq = 0, s_dbgDropped = 0;
+static bool s_dbgWasOn = false;
+
+static bool uartDebugOn(unsigned long now) {
+  const unsigned long until = uartDebugUntil;
+  return until != 0 && (long)(until - now) > 0;
+}
+
+// JSON string body: printable ASCII kept (" and \ escaped), other bytes as \u00XX.
+static String dbgEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 16);
+  for (unsigned int i = 0; i < in.length() && out.length() < kDbgMaxChars; i++) {
+    uint8_t b = (uint8_t)in[i];
+    if (b == '"' || b == '\\') { out += '\\'; out += (char)b; }
+    else if (b >= 0x20 && b <= 0x7E) out += (char)b;
+    else { char h[8]; snprintf(h, sizeof(h), "\\u%04X", b); out += h; }
+  }
+  if (out.length() >= kDbgMaxChars) out += "...";
+  return out;
+}
+
+static char termName(char c) {
+  return c == '*' ? '*' : c == '\n' ? 'n' : c == '\r' ? 'r' : c == '\0' ? '0' : '?';
+}
+
+static void uartDebugCapture(const String& line, char kind, char term) {
+  if (!uartDebugOn(millis())) return;
+  if (s_dbgLen >= kDbgQueue) { s_dbgDropped++; return; }
+  s_dbgQ[s_dbgLen++] = {line, kind, termName(term)};
+}
+
+// Publish queued lines (+ on/off markers). Called from loop() after the drain.
+static void uartDebugFlush(unsigned long now) {
+  const bool on = uartDebugOn(now);
+  if (!on && uartDebugUntil != 0) uartDebugUntil = 0;       // expired
+  const bool canPublish = isMqttConnected && !MQTT_TOPIC_DEBUG_UART.isEmpty();
+
+  if (on != s_dbgWasOn) {
+    s_dbgWasOn = on;
+    if (canPublish) {
+      String m = on
+          ? "{\"debug\":\"on\",\"minutes\":" + String((uartDebugUntil - now + 59999UL) / 60000UL) +
+                ",\"fw\":\"" + currentFirmwareVersion + "\",\"baud\":9600,\"expected_fields\":" +
+                String(s_expectedFields) + "}"
+          : "{\"debug\":\"off\",\"lines\":" + String(s_dbgSeq) +
+                ",\"dropped\":" + String(s_dbgDropped) + "}";
+      mqttClient.publish(MQTT_TOPIC_DEBUG_UART.c_str(), m.c_str());
+    }
+    if (on) { s_dbgSeq = 0; s_dbgDropped = 0; }
+    else s_dbgLen = 0;
+  }
+  if (!on || s_dbgLen == 0) return;
+  if (!canPublish) { s_dbgDropped += s_dbgLen; s_dbgLen = 0; return; }
+
+  static unsigned long winStart = 0;
+  static int winCount = 0;
+  if (now - winStart >= 1000) { winStart = now; winCount = 0; }
+  for (int i = 0; i < s_dbgLen; i++) {
+    if (winCount >= kDbgMaxPerSec) { s_dbgDropped++; continue; }
+    winCount++;
+    const DbgLine& d = s_dbgQ[i];
+    String m = "{\"n\":" + String(++s_dbgSeq) + ",\"k\":\"" + String(d.kind) +
+               "\",\"t\":\"" + String(d.term) + "\",\"len\":" + String(d.text.length()) +
+               ",\"f\":\"" + dbgEscape(d.text) + "\"";
+    if (s_dbgDropped) m += ",\"dropped\":" + String(s_dbgDropped);
+    m += "}";
+    mqttClient.publish(MQTT_TOPIC_DEBUG_UART.c_str(), m.c_str());
+  }
+  for (int i = 0; i < s_dbgLen; i++) s_dbgQ[i].text = "";
+  s_dbgLen = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Compatibility with a test STM32 build that prints its two energy odometers
+// as debug text instead of fields 11-12 (seen on GTIControl1218). Per frame it
+// sends two lines, both ending in '*':
+//   energy_import_wh 224265#230.54#49.96#...#853.06     (label + 10 fields)
+//   energy_gen_wh 20494#
+// They are merged into the standard 12-field frame
+//   230.54#49.96#...#853.06#<gen>#<import>
+// (field 11 = discharged/generated -> backend totalA "xả",
+//  field 12 = grid import         -> backend totalA2 "lấy lưới").
+// Only lines starting with these exact labels are touched, so boards sending
+// normal frames are not affected. Never publish the 10-field part alone: the
+// backend would add its last two numbers to the day's energy on every frame.
+// ---------------------------------------------------------------------------
+static const char kDbgImportLabel[] = "energy_import_wh ";
+static const char kDbgGenLabel[]    = "energy_gen_wh ";
+static const unsigned long kDbgPairMs = 3000;   // gen line must follow within 3 s
+static String        s_dbgPendFields;           // 10 fields from the import line
+static String        s_dbgPendImport;
+static unsigned long s_dbgPendAt = 0;
+
+enum DebugFrameResult { DF_NOT_DEBUG, DF_CONSUMED, DF_MERGED };
+
+// "<label>NNN#rest" -> number NNN (must be numeric) and rest (without the '#').
+static bool splitLabeled(const String& frame, const char* label, String& num, String& rest) {
+  const int ll = strlen(label);
+  const int hash = frame.indexOf('#', ll);
+  num = hash < 0 ? frame.substring(ll) : frame.substring(ll, hash);
+  num.trim();
+  rest = hash < 0 ? String() : frame.substring(hash + 1);
+  return num.length() > 0 && isNumericField(num, false) && num.indexOf('.') < 0;
+}
+
+static DebugFrameResult convertDebugFrame(const String& frame, String& merged) {
+  if (frame.startsWith(kDbgImportLabel)) {
+    String num, rest;
+    s_dbgPendFields = "";
+    if (!splitLabeled(frame, kDbgImportLabel, num, rest)) return DF_CONSUMED;
+    if (rest.endsWith("#")) rest.remove(rest.length() - 1);
+    s_dbgPendFields = rest;
+    s_dbgPendImport = num;
+    s_dbgPendAt = millis();
+    return DF_CONSUMED;                 // wait for the gen line
+  }
+  if (frame.startsWith(kDbgGenLabel)) {
+    String num, rest;
+    const bool ok = splitLabeled(frame, kDbgGenLabel, num, rest) &&
+                    s_dbgPendFields.length() > 0 &&
+                    millis() - s_dbgPendAt <= kDbgPairMs;
+    if (ok) merged = s_dbgPendFields + "#" + num + "#" + s_dbgPendImport;
+    s_dbgPendFields = "";
+    if (!ok) return DF_CONSUMED;
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      trackLog("STM_DEBUG_COMPAT", "merging energy_import_wh/energy_gen_wh debug lines", 0);
+    }
+    return DF_MERGED;                   // validated by acceptFrame() like any frame
+  }
+  return DF_NOT_DEBUG;
+}
+
 // Remember the STM32 firmware version from a 13-field frame (last field x.y.z).
 static void recordStmVersion(const String& frame) {
   int end = frame.length();
@@ -527,7 +674,10 @@ void setup() {
                   ",\"busy\":" + String(((isStartConnect && !param_ssid.isEmpty()) ||
                                           connectAttemptStart != 0) ? 1 : 0) +
                   ",\"reason\":" + String((int)staDisconnectReason) +
-                  ",\"ssid\":\"" + jsonEscape(param_ssid) + "\"" + "}";
+                  ",\"ssid\":\"" + jsonEscape(param_ssid) + "\"" +
+                  // id: this device's id (= its setup AP name), so the app
+                  // can list the new device before its server list refreshes.
+                  ",\"id\":\"" + jsonEscape(wifiBroadcastSSID) + "\"" + "}";
     request->send(200, "application/json", json);
   });
 
@@ -594,7 +744,17 @@ void loop() {
       } else if (stmMsgBuffer.length() > 0) {
         String frame = stmMsgBuffer;
         frame.trim();
-        if (acceptFrame(frame, hwError)) {
+        // Test STM32 build with debug-text odometers: merge its two lines into
+        // one standard frame (see convertDebugFrame()).
+        String merged;
+        const DebugFrameResult dbg = hwError ? DF_NOT_DEBUG : convertDebugFrame(frame, merged);
+        if (dbg == DF_MERGED) frame = merged;
+        const bool frameOk = dbg != DF_CONSUMED && acceptFrame(frame, hwError);
+        // raw line, untrimmed; 'c' = debug line held for merging
+        uartDebugCapture(stmMsgBuffer, dbg == DF_CONSUMED ? 'c' : (frameOk ? 'a' : 'r'), c);
+        if (dbg == DF_CONSUMED) {
+          // nothing to publish yet
+        } else if (frameOk) {
           stmLatestFrame = frame;        // keep only the most recent valid frame
           recordStmVersion(frame);       // field 13 (STM32 firmware >= 2.0.0)
           DBG_PRINT("[STM32] ");
@@ -611,11 +771,13 @@ void loop() {
         // Terminator never arrived: drop this line AND its tail up to the next
         // terminator (the tail would otherwise look like a new frame).
         rejectFrame(UC_TOO_LONG, stmMsgBuffer);
+        uartDebugCapture(stmMsgBuffer, 'l', '?');
         stmMsgBuffer = "";
         stmSkipToTerminator = true;
       }
     }
   }
+  uartDebugFlush(currentMillis);         // cmd/uart-debug: raw lines -> MQTT
   reportUartStats(currentMillis);        // UART_STATS / STM32_BAD_FRAME every 5 min
   reportMemStats(currentMillis);         // STACK_STATS every 30 min
 
