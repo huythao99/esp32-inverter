@@ -448,13 +448,15 @@ static void reportMemStats(unsigned long now) {
   }
   s_lastMemReport = now;
 
-  char msg[100];
+  // rssi (dBm, 0 = not connected) feeds the CMS device-health page.
+  char msg[128];
   snprintf(msg, sizeof(msg),
-           "heap=%u min=%u blk=%u loop=%ld worker=%ld async=%ld",
+           "heap=%u min=%u blk=%u loop=%ld worker=%ld async=%ld rssi=%d",
            (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
            (unsigned)ESP.getMaxAllocHeap(),
            (long)uxTaskGetStackHighWaterMark(nullptr),   // this (loop) task
-           stackFreeBytes("http_worker"), stackFreeBytes("async_tcp"));
+           stackFreeBytes("http_worker"), stackFreeBytes("async_tcp"),
+           WiFi.status() == WL_CONNECTED ? (int)WiFi.RSSI() : 0);
   trackLog("STACK_STATS", String(msg), kMemReportMs - 1000);
   DBG_PRINT("[MEM] "); DBG_PRINTLN(msg);
 }
