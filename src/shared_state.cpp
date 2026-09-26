@@ -64,7 +64,7 @@ volatile bool unlockPending  = false;
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.0.17";
+String currentFirmwareVersion = "1.0.18";
 String param_ssid;
 String param_password;
 
