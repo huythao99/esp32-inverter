@@ -1,0 +1,189 @@
+# Build the ESP32 inverter firmware and publish it as BETA in the CMS whenever
+# currentFirmwareVersion (src/shared_state.cpp) changes on main.
+#
+# Promote to stable from the CMS afterwards (ESP32 Firmware -> Set stable, or
+# Staged Rollout). A version that already exists in the CMS is never
+# re-uploaded (the backend refuses to overwrite a version anyway).
+#
+# Repository secrets:
+#   CMS_API_URL    https://giabao-inverter.com
+#   CMS_USERNAME   CMS admin account used by CI (create a dedicated one)
+#   CMS_PASSWORD
+name: Firmware (beta)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'lib/**'
+      - 'platformio.ini'
+      - '.github/workflows/firmware.yml'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build + upload even if the version did not change'
+        type: boolean
+        default: false
+
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PRODUCT: inverter
+  VERSION_FILE: src/shared_state.cpp
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # push the vX.Y.Z tag
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          read_version() {
+            grep -oE 'currentFirmwareVersion *= *"[0-9]+\.[0-9]+\.[0-9]+"' \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true
+          }
+          VERSION=$(read_version < "$VERSION_FILE")
+          if [ -z "$VERSION" ]; then
+            echo "::error file=$VERSION_FILE::currentFirmwareVersion not found"
+            exit 1
+          fi
+          BEFORE="${{ github.event.before }}"
+          PREV=""
+          if [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && git cat-file -e "$BEFORE" 2>/dev/null; then
+            PREV=$(git show "$BEFORE:$VERSION_FILE" 2>/dev/null | read_version)
+          fi
+          CHANGED=false
+          if [ "$VERSION" != "$PREV" ] || [ "${{ inputs.force || false }}" = "true" ]; then
+            CHANGED=true
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "Version: ${PREV:-?} -> $VERSION (changed=$CHANGED)"
+
+      - name: Log in to the CMS
+        if: steps.ver.outputs.changed == 'true'
+        id: login
+        shell: bash
+        env:
+          CMS_API_URL: ${{ secrets.CMS_API_URL }}
+          CMS_USERNAME: ${{ secrets.CMS_USERNAME }}
+          CMS_PASSWORD: ${{ secrets.CMS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for s in CMS_API_URL CMS_USERNAME CMS_PASSWORD; do
+            [ -n "${!s}" ] || { echo "::error::secret $s is not set"; exit 1; }
+          done
+          BODY=$(jq -n --arg u "$CMS_USERNAME" --arg p "$CMS_PASSWORD" '{username:$u,password:$p}')
+          RES=$(curl -sS --fail-with-body -X POST "$CMS_API_URL/api/cms/login" \
+            -H 'Content-Type: application/json' -d "$BODY") || {
+            echo "::error::CMS login failed: $RES"; exit 1; }
+          TOKEN=$(echo "$RES" | jq -r '.accessToken // empty')
+          [ -n "$TOKEN" ] || { echo "::error::no accessToken in the login response"; exit 1; }
+          echo "::add-mask::$TOKEN"
+          # Kept in a file: step outputs holding a masked value can be dropped.
+          umask 077
+          echo "$TOKEN" > "$RUNNER_TEMP/cms_token"
+
+      - name: Skip if already in the CMS
+        if: steps.ver.outputs.changed == 'true'
+        id: exists
+        shell: bash
+        env:
+          CMS_API_URL: ${{ secrets.CMS_API_URL }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(cat "$RUNNER_TEMP/cms_token")
+          LIST=$(curl -sS --fail-with-body "$CMS_API_URL/api/cms/esp-firmwares?product=$PRODUCT" \
+            -H "Authorization: Bearer $TOKEN")
+          if echo "$LIST" | jq -e --arg v "$VERSION" 'map(select(.version == $v)) | length > 0' >/dev/null; then
+            echo "::notice::$PRODUCT v$VERSION is already in the CMS - nothing to upload"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache PlatformIO
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Build
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pip install --upgrade platformio
+          pio run -e esp32dev
+          BIN=.pio/build/esp32dev/firmware.bin
+          test -s "$BIN"
+          grep -aq "${{ steps.ver.outputs.version }}" "$BIN" || {
+            echo "::error::firmware.bin does not contain version ${{ steps.ver.outputs.version }}"; exit 1; }
+          echo "Size: $(stat -c %s "$BIN") bytes"
+
+      - name: Keep the build
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PRODUCT }}-${{ steps.ver.outputs.version }}
+          path: |
+            .pio/build/esp32dev/firmware.bin
+            .pio/build/esp32dev/firmware.elf
+          retention-days: 90
+
+      - name: Upload to the CMS as beta
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        shell: bash
+        env:
+          CMS_API_URL: ${{ secrets.CMS_API_URL }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(cat "$RUNNER_TEMP/cms_token")
+          NOTES="CI $(git rev-parse --short HEAD): $(git log -1 --pretty=%s | cut -c1-200)"
+          RES=$(curl -sS --fail-with-body -X POST "$CMS_API_URL/api/cms/esp-firmwares/upload" \
+            -H "Authorization: Bearer $TOKEN" \
+            -F "bin=@.pio/build/esp32dev/firmware.bin;type=application/octet-stream" \
+            -F "product=$PRODUCT" \
+            -F "version=$VERSION" \
+            -F "activate=beta" \
+            -F "notes=$NOTES") || { echo "::error::upload failed: $RES"; exit 1; }
+          echo "$RES" | jq '{version, channels, size, sha256, warning}'
+          WARN=$(echo "$RES" | jq -r '.warning // empty')
+          [ -z "$WARN" ] || echo "::warning::$WARN"
+          echo "### $PRODUCT v$VERSION uploaded and set as **beta**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Promote it in the CMS (ESP32 Firmware -> Set stable, or Staged Rollout)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Tag the release
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        shell: bash
+        run: |
+          TAG="v${{ steps.ver.outputs.version }}"
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists"
+          else
+            git tag "$TAG" && git push origin "$TAG" || echo "::warning::could not push tag $TAG"
+          fi
