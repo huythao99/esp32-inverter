@@ -63,8 +63,6 @@ bool connectToMqtt() {
 
     String currentUid = getUid();
     if (!currentUid.isEmpty()) {
-      MQTT_TOPIC_SETUP        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/setup/value";
-      MQTT_TOPIC_SCHEDULE     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/schedule/value";
       MQTT_TOPIC_DATA         = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/data";
       MQTT_TOPIC_STATUS       = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/status";
       MQTT_TOPIC_FIRMWARE     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/firmware/update";
@@ -83,8 +81,6 @@ bool connectToMqtt() {
       // STATUS / DATA: the device publishes those itself, so subscribing echoes
       // every message straight back into the callback (self-flood) and the slow
       // 9600-baud debug prints starve the SoftwareSerial STM32 link.
-      mqttClient.subscribe(MQTT_TOPIC_SETUP.c_str());
-      mqttClient.subscribe(MQTT_TOPIC_SCHEDULE.c_str());
       mqttClient.subscribe(MQTT_TOPIC_FIRMWARE.c_str());
       mqttClient.subscribe(MQTT_TOPIC_CMD_SETTINGS.c_str(), 1);  // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1

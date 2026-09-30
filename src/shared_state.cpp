@@ -15,8 +15,6 @@ PubSubClient            mqttClient(mqttWifiClient);
 
 // ---- MQTT topics ----------------------------------------------------------
 String MQTT_TOPIC_DATA;
-String MQTT_TOPIC_SETUP;
-String MQTT_TOPIC_SCHEDULE;
 String MQTT_TOPIC_STATUS;
 String MQTT_TOPIC_FIRMWARE;
 String MQTT_TOPIC_OTA_STATUS;
@@ -64,7 +62,7 @@ volatile bool unlockPending  = false;
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.1.0";
+String currentFirmwareVersion = "1.1.1";
 String param_ssid;
 String param_password;
 

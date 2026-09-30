@@ -79,8 +79,6 @@ extern PubSubClient            mqttClient;
 
 // ---- MQTT topics (built on connect, Core 1) -------------------------------
 extern String MQTT_TOPIC_DATA;
-extern String MQTT_TOPIC_SETUP;
-extern String MQTT_TOPIC_SCHEDULE;
 extern String MQTT_TOPIC_STATUS;
 extern String MQTT_TOPIC_FIRMWARE;
 extern String MQTT_TOPIC_OTA_STATUS;
