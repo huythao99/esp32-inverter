@@ -181,12 +181,14 @@ static void rejectFrame(UartCounter reason, const String& frame) {
   s_lastBadFrame = escapeFrame(frame);
 }
 
-// Field count this STM32 sends (10 or 12), learned from the first valid frame
-// after boot. A frame whose head was lost can still split into exactly 10
-// fields (a 12-field frame minus its first two), so once the count is known a
-// different count is rejected — unless it repeats kFieldRelearnRun times in a
-// row (the STM32 firmware really changed).
-// Frame layouts: 10 fields, 12 fields (odometers), or 12 + 13th field = STM32
+// Field count this STM32 sends (8, 10 or 12), learned from the first valid
+// frame after boot. A frame whose head was lost can still split into exactly
+// 10 (or 8) fields (a longer frame minus its first two), so once the count is
+// known a different count is rejected — unless it repeats kFieldRelearnRun
+// times in a row (the STM32 firmware really changed).
+// Frame layouts: 8 fields (old boards: no energy fields, display only — the
+// backend never adds energy for them), 10 fields (per-frame energy),
+// 12 fields (odometers), or 12 + 13th field = STM32
 // firmware version "x.y.z" (STM32 firmware >= 2.0.0). 12 and 13 share one
 // layout for the learned count below, so an STM32 FOTA that adds the version
 // field doesn't trigger a relearn.
@@ -212,7 +214,7 @@ static const int kFieldRelearnRun = 5;
 // Rejected frames are counted for UART_STATS and one escaped sample is kept
 // for STM32_BAD_FRAME. A frame that passes here contains only digits, '.',
 // '+', '-', '#' and an optional leading '$', so it is also JSON-safe.
-// Accepted: 10 or 12 numeric fields, or 12 numeric + a 13th "x.y.z" version.
+// Accepted: 8, 10 or 12 numeric fields, or 12 numeric + a 13th "x.y.z" version.
 static bool acceptFrame(const String& frame, bool hwError) {
   if (hwError) { rejectFrame(UC_DROP_HWERR, frame); return false; }
 
@@ -242,11 +244,11 @@ static bool acceptFrame(const String& frame, bool hwError) {
   }
 
   if (badChar)                                  { rejectFrame(UC_BAD_CHAR, frame);   return false; }
-  if (fields != 10 && fields != 12 && fields != 13) { rejectFrame(UC_BAD_FIELDS, frame); return false; }
+  if (fields != 8 && fields != 10 && fields != 12 && fields != 13) { rejectFrame(UC_BAD_FIELDS, frame); return false; }
   if (!allNumeric || !versionOk)                { rejectFrame(UC_BAD_NUMBER, frame); return false; }
 
   // 12 and 13 fields are the same layout (13 = 12 + version).
-  const int layout = (fields == 10) ? 10 : 12;
+  const int layout = (fields >= 12) ? 12 : fields;   // 8, 10 or 12
   if (s_expectedFields == 0 || layout == s_expectedFields) {
     s_expectedFields = layout;
     s_otherFieldsRun = 0;
