@@ -584,6 +584,10 @@ void setup() {
     }
   }
 
+  // Grid-tie OFF survives a reboot even before MQTT reconnects.
+  gridTieOff = loadGridTieOff();
+  if (gridTieOff) DBG_PRINTLN("Grid-tie OFF (from storage)");
+
   netHttpInit();
 
   // MQTT init

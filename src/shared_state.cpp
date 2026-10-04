@@ -22,6 +22,7 @@ String MQTT_TOPIC_CMD_SETTINGS;
 String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
 String MQTT_TOPIC_BLACKLIST;
+String MQTT_TOPIC_CMD_GRID_TIE;
 String MQTT_TOPIC_CMD_RESTART;
 String MQTT_TOPIC_CMD_UART_DEBUG;
 String MQTT_TOPIC_DEBUG_UART;
@@ -58,6 +59,12 @@ volatile unsigned long uartDebugUntil = 0;
 // ---- Blacklist / device lock ----------------------------------------------
 volatile bool deviceLocked  = false;
 volatile bool unlockPending  = false;
+
+// ---- Grid-tie OFF ---------------------------------------------------------
+volatile bool gridTieOff = false;
+// Same command the server serves as setting/schedule while OFF ("99001001"):
+// 99.00 V cut-off, 1 W (1 + 1000).
+const char* const GRID_TIE_OFF_OUT = "*9900@1001#";
 
 // ---- Identity / config ----------------------------------------------------
 String uid;

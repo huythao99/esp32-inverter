@@ -71,6 +71,7 @@ bool connectToMqtt() {
       MQTT_TOPIC_CMD_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/schedule";
       MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
       MQTT_TOPIC_BLACKLIST    = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/blacklist";
+      MQTT_TOPIC_CMD_GRID_TIE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/grid-tie";
       MQTT_TOPIC_CMD_RESTART  = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/restart";
       MQTT_TOPIC_CMD_UART_DEBUG = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/uart-debug";
       MQTT_TOPIC_DEBUG_UART     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/debug/uart";
@@ -86,6 +87,7 @@ bool connectToMqtt() {
       mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_BLACKLIST.c_str(), 1);     // QoS 1: lock must not be missed
+      mqttClient.subscribe(MQTT_TOPIC_CMD_GRID_TIE.c_str(), 1);  // QoS 1, retained
       mqttClient.subscribe(MQTT_TOPIC_CMD_RESTART.c_str(), 1);   // QoS 1, never retained
       mqttClient.subscribe(MQTT_TOPIC_CMD_UART_DEBUG.c_str(), 1); // QoS 1, never retained
       mqttClient.subscribe(MQTT_TOPIC_STM_UPDATE.c_str());       // QoS 0, never retained
@@ -220,6 +222,22 @@ void setupMqttCallback() {
         shareValue = doc["value"].as<int>();
         sharePending = true;
         shareAt = millis();
+      }
+    }
+    // Grid-tie on/off: retained {"off":true|false}, so it also arrives right
+    // after every reconnect. A payload without "off" changes nothing.
+    else if (topicStr == MQTT_TOPIC_CMD_GRID_TIE) {
+      JsonDocument doc;
+      if (deserializeJson(doc, message) == DeserializationError::Ok &&
+          doc["off"].is<bool>()) {
+        bool off = doc["off"].as<bool>();
+        if (off != gridTieOff) {
+          gridTieOff = off;
+          trackLog("GRID_TIE", off ? "off" : "on", 0);
+        }
+        saveGridTieOff(off);   // no-op when unchanged
+        DBG_PRINT("[GRID-TIE] off=");
+        DBG_PRINTLN(off ? "true" : "false");
       }
     }
     // Blacklist topic: payload is {"lock":true|false}. Server kill switch.

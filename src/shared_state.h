@@ -86,6 +86,7 @@ extern String MQTT_TOPIC_CMD_SETTINGS;
 extern String MQTT_TOPIC_CMD_SCHEDULE;
 extern String MQTT_TOPIC_SHARE;
 extern String MQTT_TOPIC_BLACKLIST;
+extern String MQTT_TOPIC_CMD_GRID_TIE;
 extern String MQTT_TOPIC_CMD_RESTART;
 extern String MQTT_TOPIC_CMD_UART_DEBUG;   // server -> device: {"minutes":N}
 extern String MQTT_TOPIC_DEBUG_UART;       // device -> server: raw STM32 lines
@@ -130,6 +131,14 @@ extern volatile unsigned long uartDebugUntil;
 //                   applyCurrentValue() emits one *UNLOCK54321# pulse.
 extern volatile bool  deviceLocked;
 extern volatile bool  unlockPending;
+
+// ---- Grid-tie ("hoà lưới") OFF -------------------------------------------
+// From the retained cmd/grid-tie topic {"off":bool}, kept in NVS. While set,
+// applyCurrentValue() sends GRID_TIE_OFF_OUT, above share/schedule/setting and
+// below the blacklist lock. Written by the MQTT callback, read by
+// applyCurrentValue(); both on Core 1, so no mutex.
+extern volatile bool  gridTieOff;
+extern const char* const GRID_TIE_OFF_OUT;
 
 // ---- Identity / config ----------------------------------------------------
 extern String uid;

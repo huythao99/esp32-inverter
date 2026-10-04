@@ -212,6 +212,11 @@ void applyCurrentValue() {
     unlockPending = false;
     out = "*UNLOCK54321#";
     source = "unlock";
+  } else if (gridTieOff) {
+    // 0b. Grid-tie OFF (cmd/grid-tie): above share/schedule/setting, so
+    //     neither a share group nor a schedule window can feed the grid.
+    out = GRID_TIE_OFF_OUT;
+    source = "gridtie";
   }
 
   if (out.isEmpty()) {

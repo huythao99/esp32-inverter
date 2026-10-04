@@ -123,6 +123,31 @@ String loadScheduleFromStorage() {
   return value;
 }
 
+static int s_storedGridTieOff = -1;   // -1 = unknown
+
+// Stored together with the uid it belongs to: a device re-provisioned to
+// another account must not stay OFF (its new topic has no retained command).
+void saveGridTieOff(bool off) {
+  if (s_storedGridTieOff == (off ? 1 : 0)) return;
+  Preferences p;
+  if (!p.begin("grid_tie", false)) return;
+  p.putBool("off", off);
+  p.putString("uid", getUid());
+  p.end();
+  s_storedGridTieOff = off ? 1 : 0;
+}
+
+bool loadGridTieOff() {
+  Preferences p;
+  bool off = false;
+  if (p.begin("grid_tie", true)) {
+    off = p.getBool("off", false) && p.getString("uid", "") == getUid();
+    p.end();
+  }
+  s_storedGridTieOff = off ? 1 : 0;
+  return off;
+}
+
 void saveWifiBroadcastSSID(const String& ssid) {
   preferences.begin("wifi_config", false);
   preferences.putString("broadcast_ssid", ssid);

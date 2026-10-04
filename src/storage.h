@@ -25,6 +25,13 @@ String loadSettingFromStorage();
 void   saveScheduleToStorage(const String& schedule);
 String loadScheduleFromStorage();
 
+// Grid-tie OFF flag (NVS, own namespace + own Preferences object: written from
+// the MQTT callback on Core 1, while the worker on Core 0 uses `preferences`).
+// Writes only when the value changes. Ignored after re-provisioning to
+// another uid.
+void   saveGridTieOff(bool off);
+bool   loadGridTieOff();
+
 // Broadcast SSID persistence (NVS) — set once, survives firmware uploads.
 void   saveWifiBroadcastSSID(const String& ssid);
 String loadWifiBroadcastSSID();
