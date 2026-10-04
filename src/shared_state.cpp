@@ -69,7 +69,7 @@ const char* const GRID_TIE_OFF_OUT = "*9900@1001#";
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.1.1";
+String currentFirmwareVersion = "1.1.2";
 String param_ssid;
 String param_password;
 
