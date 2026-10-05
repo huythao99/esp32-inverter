@@ -35,6 +35,9 @@ bool   loadGridTieOff();
 // STM32 link protocol chosen on the server (STM_PROTO_*), NVS.
 void    saveStmProtocol(uint8_t mode);
 uint8_t loadStmProtocol();
+// AUTO mode: the board was confirmed LEGACY (echo) on a previous boot.
+void    saveStmLegacyHint(bool legacy);
+bool    loadStmLegacyHint();
 
 // Broadcast SSID persistence (NVS) — set once, survives firmware uploads.
 void   saveWifiBroadcastSSID(const String& ssid);

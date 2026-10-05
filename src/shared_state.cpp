@@ -76,7 +76,7 @@ const char* const LEGACY_LOCK_VALUE = "80001011";
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.1.3";
+String currentFirmwareVersion = "1.1.4";
 String param_ssid;
 String param_password;
 

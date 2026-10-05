@@ -562,7 +562,7 @@ void setup() {
   // STM32 link protocol: server choice (NVS) or, in AUTO, a probe of the
   // GPIO2/GPIO14 handshake of the first boards (also sets the pin modes).
   stmProtoSetting = loadStmProtocol();
-  stmLegacyDetected = detectLegacyStm();
+  stmLegacyDetected = detectLegacyStm();   // NVS hint, confirmed by echo later
   updateStmProtocol(stmProtoSetting == STM_PROTO_AUTO ? "auto" : "nvs");
   DBG_PRINT("[STM] protocol: ");
   DBG_PRINTLN(stmLegacy ? "LEGACY (handshake + raw value)" : "NEW");
@@ -770,6 +770,7 @@ void loop() {
         } else if (frameOk) {
           stmLatestFrame = frame;        // keep only the most recent valid frame
           recordStmVersion(frame);       // field 13 (STM32 firmware >= 2.0.0)
+          stmProtoOnFrame(frame);        // AUTO protocol detection (echo)
           DBG_PRINT("[STM32] ");
           DBG_PRINTLN(frame);
         } else {

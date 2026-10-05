@@ -165,6 +165,23 @@ uint8_t loadStmProtocol() {
   return mode <= STM_PROTO_LEGACY ? mode : STM_PROTO_AUTO;
 }
 
+void saveStmLegacyHint(bool legacy) {
+  Preferences p;
+  if (!p.begin("stm_proto", false)) return;
+  if (p.getBool("legacy", false) != legacy) p.putBool("legacy", legacy);
+  p.end();
+}
+
+bool loadStmLegacyHint() {
+  Preferences p;
+  bool legacy = false;
+  if (p.begin("stm_proto", true)) {
+    legacy = p.getBool("legacy", false);
+    p.end();
+  }
+  return legacy;
+}
+
 void saveWifiBroadcastSSID(const String& ssid) {
   preferences.begin("wifi_config", false);
   preferences.putString("broadcast_ssid", ssid);

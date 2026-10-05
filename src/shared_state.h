@@ -148,8 +148,10 @@ extern const char* const GRID_TIE_OFF_OUT;
 //          STM_START (GPIO2, ESP->STM) / STM_READY (GPIO14, STM->ESP) and the
 //          raw 8-digit value "VVVVPPPP" (no '*', '@', '#').
 // stmProtoSetting comes from the server (retained cmd/stm-protocol, kept in
-// NVS): 0 = auto (detected at boot), 1 = force NEW, 2 = force LEGACY.
-// stmLegacy is the mode in use. Both only touched on Core 1.
+// NVS): 0 = auto, 1 = force NEW, 2 = force LEGACY. AUTO starts NEW and only
+// keeps LEGACY once the STM32 echoes a handshake-written command (frame fields
+// 7/8), see logic.cpp. stmLegacyDetected = confirmed LEGACY (NVS hint).
+// stmLegacy is the mode in use. All only touched on Core 1.
 enum : uint8_t { STM_PROTO_AUTO = 0, STM_PROTO_NEW = 1, STM_PROTO_LEGACY = 2 };
 extern volatile uint8_t stmProtoSetting;
 extern volatile bool    stmLegacyDetected;

@@ -35,16 +35,21 @@ void applyCurrentValue();
 // equivalent, e.g. the unlock pulse). The lock command maps to LEGACY_LOCK_VALUE.
 String toLegacyValue(const String& out);
 
-// Boot-time probe (setup(), ~2.5 s at most): raise STM_START and see whether
-// the STM32 answers on STM_READY. True = LEGACY board.
+// setup(): STM_START/STM_READY pin modes. Returns the NVS hint "confirmed
+// LEGACY on a previous boot" (AUTO then tries legacy first). No pin probing:
+// AUTO decides from the STM32's echo of the command (stmProtoOnFrame).
 bool detectLegacyStm();
+
+// Every valid STM32 frame: AUTO detection compares fields 7/8 (cut-off /
+// limit the STM32 runs) with the last command written.
+void stmProtoOnFrame(const String& frame);
 
 // Recompute stmLegacy from stmProtoSetting + stmLegacyDetected (switches the
 // writer over and re-sends the current value in the new format).
 void updateStmProtocol(const char* source);
 
-// From loop(): passive detection in AUTO mode + the STM_PROTOCOL log once
-// MQTT is up.
+// From loop(): AUTO phase changes (try legacy / revert) + the STM_PROTOCOL
+// log once MQTT is up.
 void stmProtocolTick(unsigned long now);
 
 // JSON helpers.

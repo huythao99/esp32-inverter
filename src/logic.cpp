@@ -4,7 +4,8 @@
 #include "config.h"
 #include "worker.h"   // trackLog() (enqueues; non-blocking)
 #include "time.h"
-#include <esp_task_wdt.h>
+#include "storage.h"   // STM legacy hint (NVS)
+#include <math.h>
 
 String convertSetupValue(const String& input) {
   if (input.length() != 8) {
@@ -214,6 +215,8 @@ String toLegacyValue(const String& out) {
   return String(buf);
 }
 
+static void noteWritten(const String& out);   // echo check (below)
+
 static void legacyWrite(const String& out) {
   const String raw = toLegacyValue(out);
   if (raw.isEmpty()) return;
@@ -227,83 +230,169 @@ static void legacyWrite(const String& out) {
   digitalWrite(STM_START, LOW);
   testSerial.write(raw.c_str());
   s_legacyWriteAt = now;
+  noteWritten(out);
   DBG_PRINT("[APPLY legacy] "); DBG_PRINTLN(raw);
 }
 
-// STM_READY high on most of the samples over `ms` (pull-down: a pin that is
-// not wired reads low).
-static bool readyHighFor(unsigned long ms) {
-  const unsigned long t0 = millis();
-  int high = 0, n = 0;
-  while (millis() - t0 < ms) {
-    n++;
-    if (digitalRead(STM_READY) == HIGH) high++;
-    delay(10);
-  }
-  return n > 0 && high * 4 >= n * 3;     // >= 75 %
-}
-
-bool detectLegacyStm() {
-  pinMode(STM_READY, INPUT_PULLDOWN);
-  pinMode(STM_START, OUTPUT);
-  digitalWrite(STM_START, LOW);
-  esp_task_wdt_reset();
-
-  // Already holding READY high: a legacy board waiting for data.
-  bool legacy = readyHighFor(300);
-  if (!legacy) {
-    // Ask, like the old firmware did for a new value, and wait for READY.
-    digitalWrite(STM_START, HIGH);
-    const unsigned long t0 = millis();
-    while (!legacy && millis() - t0 < 2000) {
-      legacy = readyHighFor(100);
-      esp_task_wdt_reset();
-    }
-  }
-  // NEW mode keeps STM_START low. In LEGACY mode the writer raises it again
-  // for the first value.
-  digitalWrite(STM_START, LOW);
-  return legacy;
-}
+// ---------------------------------------------------------------------------
+// AUTO detection, confirmed by the STM32's own echo.
+//
+// The STM32 reports the cut-off / limit it is running in frame fields 7 and 8
+// ("...#48.50#1600.00"). A pin level alone is not proof (a new board may also
+// hold GPIO14 high), so:
+//   1. TRY_NEW    : always start with "*VVVV@PPPP#". 3 frames echoing the
+//                   command -> CONFIRMED new.
+//   2. If the echo stays wrong >= kTryNewMs after the command was written AND
+//      STM_READY is high (a legacy board waits for data) -> TRY_LEGACY.
+//   3. TRY_LEGACY : 3 echoing frames -> CONFIRMED legacy (hint kept in NVS so
+//                   the next boot tries legacy first). No echo within
+//                   kTryLegacyMs -> back to TRY_NEW, next legacy try only
+//                   after kRetryLegacyMs.
+// Forced modes (CMS) skip all of this.
+// ---------------------------------------------------------------------------
+enum AutoPhase : uint8_t { AP_TRY_NEW, AP_TRY_LEGACY, AP_CONFIRMED };
+static AutoPhase     s_autoPhase = AP_TRY_NEW;
+static unsigned long s_phaseAt = 0;           // phase start
+static unsigned long s_nextLegacyTryAt = 0;   // backoff after a failed legacy try
+static int           s_echoOk = 0;
+static String        s_echoCmd = "";          // last command written to the STM32
+static unsigned long s_echoCmdAt = 0;         // when it was first written
+static const unsigned long kEchoSettleMs   = 4000;
+static const unsigned long kTryNewMs       = 20000;
+static const unsigned long kTryLegacyMs    = 40000;
+static const unsigned long kRetryLegacyMs  = 600000;
+static const int           kEchoConfirm    = 3;
 
 static bool        s_protoLogPending = true;
 static const char* s_protoSource = "auto";
 
+// Called whenever a command actually goes out on the UART (both modes).
+static void noteWritten(const String& out) {
+  if (out != s_echoCmd) {
+    s_echoCmd = out;
+    s_echoCmdAt = millis();
+    s_echoOk = 0;
+  }
+}
+
+static void setLegacy(bool legacy) {
+  if (legacy == stmLegacy) return;
+  stmLegacy = legacy;
+  s_lastWrittenValue = "";             // re-send in the new format at once
+  s_legacyValue = "";
+  s_legacyWriteAt = 0;
+  s_echoCmd = "";
+  s_echoOk = 0;
+  digitalWrite(STM_START, LOW);
+}
+
+bool detectLegacyStm() {
+  // Pin setup only; the decision is made from the STM32's echo (above).
+  // Returns the hint of the previous boot (NVS): try legacy first.
+  pinMode(STM_READY, INPUT_PULLDOWN);
+  pinMode(STM_START, OUTPUT);
+  digitalWrite(STM_START, LOW);
+  return loadStmLegacyHint();
+}
+
 void updateStmProtocol(const char* source) {
-  const bool legacy =
-      stmProtoSetting == STM_PROTO_LEGACY ||
-      (stmProtoSetting == STM_PROTO_AUTO && stmLegacyDetected);
-  if (legacy != stmLegacy) {
-    stmLegacy = legacy;
-    s_lastWrittenValue = "";             // re-send in the new format at once
-    s_legacyValue = "";
-    s_legacyWriteAt = 0;
-    digitalWrite(STM_START, LOW);
+  if (stmProtoSetting == STM_PROTO_LEGACY) {
+    setLegacy(true);
+  } else if (stmProtoSetting == STM_PROTO_NEW) {
+    setLegacy(false);
+  } else {
+    // AUTO: (re)start detection; a legacy hint from the last boot goes first.
+    s_autoPhase = stmLegacyDetected ? AP_TRY_LEGACY : AP_TRY_NEW;
+    s_phaseAt = millis();
+    setLegacy(stmLegacyDetected);
   }
   s_protoSource = source;
   s_protoLogPending = true;
 }
 
+// "a#b#c#d#e#f#CUTOFF#LIMIT[#...]" -> did the STM32 take s_echoCmd?
+static int echoMatches(const String& frame) {
+  if (s_echoCmd.length() < 4 || s_echoCmd[0] != '*' ||
+      s_echoCmd.startsWith("*LOCK") || s_echoCmd.startsWith("*UNLOCK")) {
+    return -1;                          // nothing to compare against
+  }
+  const int at = s_echoCmd.indexOf('@');
+  const int hash = s_echoCmd.indexOf('#');
+  if (at < 2 || hash <= at + 1) return -1;
+  const float wantCut = s_echoCmd.substring(1, at).toInt() / 100.0f;
+  const float wantLim = (float)(s_echoCmd.substring(at + 1, hash).toInt() - 1000);
+
+  int idx = 0, from = 0;
+  float cut = NAN, lim = NAN;
+  while (idx <= 7) {
+    int sep = frame.indexOf('#', from);
+    String f = sep < 0 ? frame.substring(from) : frame.substring(from, sep);
+    if (idx == 6) cut = f.toFloat();
+    if (idx == 7) { lim = f.toFloat(); break; }
+    if (sep < 0) return -1;
+    from = sep + 1;
+    idx++;
+  }
+  if (isnan(cut) || isnan(lim)) return -1;
+  return (fabsf(cut - wantCut) < 0.06f && fabsf(lim - wantLim) < 1.5f) ? 1 : 0;
+}
+
+void stmProtoOnFrame(const String& frame) {
+  if (stmProtoSetting != STM_PROTO_AUTO || s_autoPhase == AP_CONFIRMED) return;
+  if (s_echoCmd.isEmpty() || millis() - s_echoCmdAt < kEchoSettleMs) return;
+  const int m = echoMatches(frame);
+  if (m < 0) return;
+  if (m == 0) { s_echoOk = 0; return; }
+  if (++s_echoOk < kEchoConfirm) return;
+
+  const bool legacy = s_autoPhase == AP_TRY_LEGACY;
+  s_autoPhase = AP_CONFIRMED;
+  if (legacy != stmLegacyDetected) {
+    stmLegacyDetected = legacy;
+    saveStmLegacyHint(legacy);
+  }
+  s_protoSource = legacy ? "auto-legacy" : "auto-new";
+  s_protoLogPending = true;
+}
+
 void stmProtocolTick(unsigned long now) {
-  // AUTO + not detected at boot (e.g. the STM32 came up late): a legacy board
-  // shows itself by holding READY high. 3 checks 1 s apart.
-  static unsigned long lastCheck = 0;
-  static int highCount = 0;
-  if (stmProtoSetting == STM_PROTO_AUTO && !stmLegacyDetected &&
-      now - lastCheck >= 1000) {
-    lastCheck = now;
-    highCount = digitalRead(STM_READY) == HIGH ? highCount + 1 : 0;
-    if (highCount >= 3) {
-      stmLegacyDetected = true;
-      updateStmProtocol("auto-late");
+  if (stmProtoSetting == STM_PROTO_AUTO && s_autoPhase != AP_CONFIRMED) {
+    if (s_autoPhase == AP_TRY_NEW) {
+      // Echo still wrong long after the command went out + a legacy board's
+      // READY line is up -> try the handshake.
+      if (!s_echoCmd.isEmpty() && s_echoOk == 0 &&
+          now - s_echoCmdAt >= kTryNewMs && now - s_phaseAt >= kTryNewMs &&
+          (long)(now - s_nextLegacyTryAt) >= 0 &&
+          digitalRead(STM_READY) == HIGH) {
+        s_autoPhase = AP_TRY_LEGACY;
+        s_phaseAt = now;
+        setLegacy(true);
+        s_protoSource = "auto-try-legacy";
+        s_protoLogPending = true;
+      }
+    } else if (now - s_phaseAt >= kTryLegacyMs) {
+      // AP_TRY_LEGACY without an echo: not a legacy board after all.
+      s_autoPhase = AP_TRY_NEW;
+      s_phaseAt = now;
+      s_nextLegacyTryAt = now + kRetryLegacyMs;
+      setLegacy(false);
+      if (stmLegacyDetected) {
+        stmLegacyDetected = false;
+        saveStmLegacyHint(false);
+      }
+      s_protoSource = "auto-revert-new";
+      s_protoLogPending = true;
     }
   }
   if (s_protoLogPending && isMqttConnected) {
     s_protoLogPending = false;
+    const char* detected =
+        s_autoPhase == AP_CONFIRMED ? (stmLegacyDetected ? "legacy" : "new")
+                                    : "unknown";
     trackLog("STM_PROTOCOL",
              String("mode=") + (stmLegacy ? "legacy" : "new") +
                  " src=" + s_protoSource +
-                 " detected=" + (stmLegacyDetected ? "legacy" : "new") +
+                 " detected=" + detected +
                  " setting=" + String((int)stmProtoSetting),
              0);
   }
@@ -381,6 +470,7 @@ void applyCurrentValue() {
   unsigned long now = millis();
   if (out != s_lastWrittenValue || now - s_lastWriteAt >= kApplyKeepaliveMs) {
     testSerial.write(out.c_str());
+    noteWritten(out);
     s_lastWrittenValue = out;
     s_lastWriteAt = now;
     DBG_PRINT("[APPLY] "); DBG_PRINTLN(out);
