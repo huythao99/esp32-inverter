@@ -275,6 +275,15 @@ static void noteWritten(const String& out) {
   }
 }
 
+// GPIO14 pull-down only while it matters (legacy handshake / AUTO still
+// checking). Once the board runs NEW for sure, back to plain INPUT exactly
+// like the firmware before 1.1.3, so a new board sees no electrical change.
+static void applyReadyPin() {
+  const bool sense = stmLegacy ||
+      (stmProtoSetting == STM_PROTO_AUTO && s_autoPhase != AP_CONFIRMED);
+  pinMode(STM_READY, sense ? INPUT_PULLDOWN : INPUT);
+}
+
 static void setLegacy(bool legacy) {
   if (legacy == stmLegacy) return;
   stmLegacy = legacy;
@@ -306,6 +315,7 @@ void updateStmProtocol(const char* source) {
     s_phaseAt = millis();
     setLegacy(stmLegacyDetected);
   }
+  applyReadyPin();
   s_protoSource = source;
   s_protoLogPending = true;
 }
@@ -351,6 +361,7 @@ void stmProtoOnFrame(const String& frame) {
     stmLegacyDetected = legacy;
     saveStmLegacyHint(legacy);
   }
+  applyReadyPin();
   s_protoSource = legacy ? "auto-legacy" : "auto-new";
   s_protoLogPending = true;
 }
@@ -380,6 +391,7 @@ void stmProtocolTick(unsigned long now) {
         stmLegacyDetected = false;
         saveStmLegacyHint(false);
       }
+      applyReadyPin();
       s_protoSource = "auto-revert-new";
       s_protoLogPending = true;
     }
