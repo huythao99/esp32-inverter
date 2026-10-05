@@ -148,6 +148,23 @@ bool loadGridTieOff() {
   return off;
 }
 
+void saveStmProtocol(uint8_t mode) {
+  Preferences p;
+  if (!p.begin("stm_proto", false)) return;
+  if (p.getUChar("mode", 255) != mode) p.putUChar("mode", mode);
+  p.end();
+}
+
+uint8_t loadStmProtocol() {
+  Preferences p;
+  uint8_t mode = STM_PROTO_AUTO;
+  if (p.begin("stm_proto", true)) {
+    mode = p.getUChar("mode", STM_PROTO_AUTO);
+    p.end();
+  }
+  return mode <= STM_PROTO_LEGACY ? mode : STM_PROTO_AUTO;
+}
+
 void saveWifiBroadcastSSID(const String& ssid) {
   preferences.begin("wifi_config", false);
   preferences.putString("broadcast_ssid", ssid);

@@ -559,8 +559,13 @@ void setup() {
   DBG_PRINT("Access Point SSID: ");
   DBG_PRINTLN(wifiBroadcastSSID);
 
-  pinMode(STM_READY, INPUT);
-  pinMode(STM_START, OUTPUT);
+  // STM32 link protocol: server choice (NVS) or, in AUTO, a probe of the
+  // GPIO2/GPIO14 handshake of the first boards (also sets the pin modes).
+  stmProtoSetting = loadStmProtocol();
+  stmLegacyDetected = detectLegacyStm();
+  updateStmProtocol(stmProtoSetting == STM_PROTO_AUTO ? "auto" : "nvs");
+  DBG_PRINT("[STM] protocol: ");
+  DBG_PRINTLN(stmLegacy ? "LEGACY (handshake + raw value)" : "NEW");
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
   readWifi();
@@ -1004,6 +1009,8 @@ void loop() {
   }
 #endif
 
+  stmProtocolTick(currentMillis);
+
   // Single writer to the STM32: share > schedule > setting, every 1s.
   if (currentMillis - previousMillisApply >= intervalApply) {
     previousMillisApply = currentMillis;
@@ -1100,7 +1107,8 @@ void loop() {
           statusMsg += "\"updatedAt\":\"" + String(timeStringBuff) + "\",";
         }
       }
-      statusMsg += "\"status\":\"online\",\"uptime\":" + String(currentMillis / 1000) + "}";
+      statusMsg += "\"status\":\"online\",\"uptime\":" + String(currentMillis / 1000) +
+                   ",\"stm\":\"" + (stmLegacy ? "legacy" : "new") + "\"}";
       String signedStatusMsg = createSignedMessage(statusMsg);
       mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
     }

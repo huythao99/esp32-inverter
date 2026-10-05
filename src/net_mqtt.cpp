@@ -72,6 +72,7 @@ bool connectToMqtt() {
       MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
       MQTT_TOPIC_BLACKLIST    = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/blacklist";
       MQTT_TOPIC_CMD_GRID_TIE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/grid-tie";
+      MQTT_TOPIC_CMD_STM_PROTOCOL = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/stm-protocol";
       MQTT_TOPIC_CMD_RESTART  = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/restart";
       MQTT_TOPIC_CMD_UART_DEBUG = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/uart-debug";
       MQTT_TOPIC_DEBUG_UART     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/debug/uart";
@@ -88,6 +89,7 @@ bool connectToMqtt() {
       mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
       mqttClient.subscribe(MQTT_TOPIC_BLACKLIST.c_str(), 1);     // QoS 1: lock must not be missed
       mqttClient.subscribe(MQTT_TOPIC_CMD_GRID_TIE.c_str(), 1);  // QoS 1, retained
+      mqttClient.subscribe(MQTT_TOPIC_CMD_STM_PROTOCOL.c_str(), 1); // QoS 1, retained
       mqttClient.subscribe(MQTT_TOPIC_CMD_RESTART.c_str(), 1);   // QoS 1, never retained
       mqttClient.subscribe(MQTT_TOPIC_CMD_UART_DEBUG.c_str(), 1); // QoS 1, never retained
       mqttClient.subscribe(MQTT_TOPIC_STM_UPDATE.c_str());       // QoS 0, never retained
@@ -238,6 +240,23 @@ void setupMqttCallback() {
         saveGridTieOff(off);   // no-op when unchanged
         DBG_PRINT("[GRID-TIE] off=");
         DBG_PRINTLN(off ? "true" : "false");
+      }
+    }
+    // STM32 link protocol chosen in the CMS: retained {"mode":"auto"|"new"|
+    // "legacy"} (see STM_PROTO_* in shared_state.h). Kept in NVS.
+    else if (topicStr == MQTT_TOPIC_CMD_STM_PROTOCOL) {
+      JsonDocument doc;
+      if (deserializeJson(doc, message) == DeserializationError::Ok &&
+          doc["mode"].is<const char*>()) {
+        const String mode = doc["mode"].as<String>();
+        const uint8_t m = mode == "legacy" ? STM_PROTO_LEGACY
+                        : mode == "new"    ? STM_PROTO_NEW
+                                           : STM_PROTO_AUTO;
+        if (m != stmProtoSetting) {
+          stmProtoSetting = m;
+          saveStmProtocol(m);
+          updateStmProtocol("cms");
+        }
       }
     }
     // Blacklist topic: payload is {"lock":true|false}. Server kill switch.

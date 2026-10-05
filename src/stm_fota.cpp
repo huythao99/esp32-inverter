@@ -93,6 +93,12 @@ void stmFotaOnTrigger(const String& payload) {
   const char* action = doc["action"] | "stm_update";
   if (strcmp(action, "stm_update") != 0) return;
 
+  // First-generation boards (GPIO handshake) have no FOTA bootloader.
+  if (stmLegacy) {
+    trackLog("STM_FOTA_REFUSED", "legacy STM32 board (GPIO handshake): no FOTA", 60000);
+    return;
+  }
+
   // Ignore stale triggers (only checkable once the clock is set).
   if (isTimeValid() && doc["ts"].is<double>()) {
     double ageMs = (double)time(nullptr) * 1000.0 - doc["ts"].as<double>();

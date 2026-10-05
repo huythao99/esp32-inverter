@@ -4,6 +4,7 @@
 #include "config.h"
 #include "worker.h"   // trackLog() (enqueues; non-blocking)
 #include "time.h"
+#include <esp_task_wdt.h>
 
 String convertSetupValue(const String& input) {
   if (input.length() != 8) {
@@ -189,6 +190,125 @@ static unsigned long s_lastWriteAt = 0;
 static const long   kApplyKeepaliveMs = 3000;   // re-send same value at least this often
 static const char*  s_lastLoggedSource = "";
 
+// ---------------------------------------------------------------------------
+// LEGACY STM32 link (boards of the esp-32 firmware before 06/2025).
+// Same handshake as that firmware: a new value raises STM_START; whenever the
+// STM32 holds STM_READY high, STM_START goes low and the raw 8-digit value is
+// written (at most once a second, as before).
+// ---------------------------------------------------------------------------
+static String        s_legacyValue = "";
+static unsigned long s_legacyWriteAt = 0;
+static const unsigned long kLegacyWriteMinMs = 1000;
+
+String toLegacyValue(const String& out) {
+  if (out.startsWith("*LOCK")) return LEGACY_LOCK_VALUE;
+  if (out.startsWith("*UNLOCK")) return "";
+  const int at = out.indexOf('@');
+  const int hash = out.indexOf('#');
+  if (out.length() < 4 || out[0] != '*' || at < 2 || hash <= at + 1) return "";
+  const long v = out.substring(1, at).toInt();
+  const long p = out.substring(at + 1, hash).toInt();
+  if (v < 0 || v > 9999 || p < 0 || p > 9999) return "";
+  char buf[12];
+  snprintf(buf, sizeof(buf), "%04ld%04ld", v, p);
+  return String(buf);
+}
+
+static void legacyWrite(const String& out) {
+  const String raw = toLegacyValue(out);
+  if (raw.isEmpty()) return;
+  if (raw != s_legacyValue) {
+    s_legacyValue = raw;
+    digitalWrite(STM_START, HIGH);       // "new value": ask the STM32 to take it
+  }
+  const unsigned long now = millis();
+  if (now - s_legacyWriteAt < kLegacyWriteMinMs) return;
+  if (digitalRead(STM_READY) != HIGH) return;   // STM32 not ready yet
+  digitalWrite(STM_START, LOW);
+  testSerial.write(raw.c_str());
+  s_legacyWriteAt = now;
+  DBG_PRINT("[APPLY legacy] "); DBG_PRINTLN(raw);
+}
+
+// STM_READY high on most of the samples over `ms` (pull-down: a pin that is
+// not wired reads low).
+static bool readyHighFor(unsigned long ms) {
+  const unsigned long t0 = millis();
+  int high = 0, n = 0;
+  while (millis() - t0 < ms) {
+    n++;
+    if (digitalRead(STM_READY) == HIGH) high++;
+    delay(10);
+  }
+  return n > 0 && high * 4 >= n * 3;     // >= 75 %
+}
+
+bool detectLegacyStm() {
+  pinMode(STM_READY, INPUT_PULLDOWN);
+  pinMode(STM_START, OUTPUT);
+  digitalWrite(STM_START, LOW);
+  esp_task_wdt_reset();
+
+  // Already holding READY high: a legacy board waiting for data.
+  bool legacy = readyHighFor(300);
+  if (!legacy) {
+    // Ask, like the old firmware did for a new value, and wait for READY.
+    digitalWrite(STM_START, HIGH);
+    const unsigned long t0 = millis();
+    while (!legacy && millis() - t0 < 2000) {
+      legacy = readyHighFor(100);
+      esp_task_wdt_reset();
+    }
+  }
+  // NEW mode keeps STM_START low. In LEGACY mode the writer raises it again
+  // for the first value.
+  digitalWrite(STM_START, LOW);
+  return legacy;
+}
+
+static bool        s_protoLogPending = true;
+static const char* s_protoSource = "auto";
+
+void updateStmProtocol(const char* source) {
+  const bool legacy =
+      stmProtoSetting == STM_PROTO_LEGACY ||
+      (stmProtoSetting == STM_PROTO_AUTO && stmLegacyDetected);
+  if (legacy != stmLegacy) {
+    stmLegacy = legacy;
+    s_lastWrittenValue = "";             // re-send in the new format at once
+    s_legacyValue = "";
+    s_legacyWriteAt = 0;
+    digitalWrite(STM_START, LOW);
+  }
+  s_protoSource = source;
+  s_protoLogPending = true;
+}
+
+void stmProtocolTick(unsigned long now) {
+  // AUTO + not detected at boot (e.g. the STM32 came up late): a legacy board
+  // shows itself by holding READY high. 3 checks 1 s apart.
+  static unsigned long lastCheck = 0;
+  static int highCount = 0;
+  if (stmProtoSetting == STM_PROTO_AUTO && !stmLegacyDetected &&
+      now - lastCheck >= 1000) {
+    lastCheck = now;
+    highCount = digitalRead(STM_READY) == HIGH ? highCount + 1 : 0;
+    if (highCount >= 3) {
+      stmLegacyDetected = true;
+      updateStmProtocol("auto-late");
+    }
+  }
+  if (s_protoLogPending && isMqttConnected) {
+    s_protoLogPending = false;
+    trackLog("STM_PROTOCOL",
+             String("mode=") + (stmLegacy ? "legacy" : "new") +
+                 " src=" + s_protoSource +
+                 " detected=" + (stmLegacyDetected ? "legacy" : "new") +
+                 " setting=" + String((int)stmProtoSetting),
+             0);
+  }
+}
+
 void applyCurrentValue() {
   // The Core 0 worker owns the UART while it flashes the STM32 (stm_fota.h).
   // Nothing may be written then; the keepalive below re-sends the value within
@@ -251,6 +371,11 @@ void applyCurrentValue() {
   if (s_lastLoggedSource != source) {
     s_lastLoggedSource = source;
     trackLog("SOURCE_CHANGE", "source=" + String(source) + " value=" + out, 300000);
+  }
+
+  if (stmLegacy) {
+    legacyWrite(out);
+    return;
   }
 
   unsigned long now = millis();

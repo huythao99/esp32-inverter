@@ -32,6 +32,10 @@ String loadScheduleFromStorage();
 void   saveGridTieOff(bool off);
 bool   loadGridTieOff();
 
+// STM32 link protocol chosen on the server (STM_PROTO_*), NVS.
+void    saveStmProtocol(uint8_t mode);
+uint8_t loadStmProtocol();
+
 // Broadcast SSID persistence (NVS) — set once, survives firmware uploads.
 void   saveWifiBroadcastSSID(const String& ssid);
 String loadWifiBroadcastSSID();

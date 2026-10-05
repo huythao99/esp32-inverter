@@ -30,6 +30,23 @@ String buildShareValue(int shareWatts);
 // on change plus a keepalive. Takes stateMutex internally.
 void applyCurrentValue();
 
+// ---- STM32 link protocol (see STM_PROTO_* in shared_state.h) --------------
+// "*VVVV@PPPP#" -> "VVVVPPPP" for LEGACY boards ("" when it has no legacy
+// equivalent, e.g. the unlock pulse). The lock command maps to LEGACY_LOCK_VALUE.
+String toLegacyValue(const String& out);
+
+// Boot-time probe (setup(), ~2.5 s at most): raise STM_START and see whether
+// the STM32 answers on STM_READY. True = LEGACY board.
+bool detectLegacyStm();
+
+// Recompute stmLegacy from stmProtoSetting + stmLegacyDetected (switches the
+// writer over and re-sends the current value in the new format).
+void updateStmProtocol(const char* source);
+
+// From loop(): passive detection in AUTO mode + the STM_PROTOCOL log once
+// MQTT is up.
+void stmProtocolTick(unsigned long now);
+
 // JSON helpers.
 String jsonEscape(const String& in);
 String createSignedMessage(const String& payload);

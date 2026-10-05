@@ -23,6 +23,7 @@ String MQTT_TOPIC_CMD_SCHEDULE;
 String MQTT_TOPIC_SHARE;
 String MQTT_TOPIC_BLACKLIST;
 String MQTT_TOPIC_CMD_GRID_TIE;
+String MQTT_TOPIC_CMD_STM_PROTOCOL;
 String MQTT_TOPIC_CMD_RESTART;
 String MQTT_TOPIC_CMD_UART_DEBUG;
 String MQTT_TOPIC_DEBUG_UART;
@@ -66,10 +67,16 @@ volatile bool gridTieOff = false;
 // 99.00 V cut-off, 1 W (1 + 1000).
 const char* const GRID_TIE_OFF_OUT = "*9900@1001#";
 
+// ---- STM32 link protocol ----------------------------------------------------
+volatile uint8_t stmProtoSetting   = STM_PROTO_AUTO;
+volatile bool    stmLegacyDetected = false;
+volatile bool    stmLegacy         = false;
+const char* const LEGACY_LOCK_VALUE = "80001011";
+
 // ---- Identity / config ----------------------------------------------------
 String uid;
 String wifiBroadcastSSID;
-String currentFirmwareVersion = "1.1.2";
+String currentFirmwareVersion = "1.1.3";
 String param_ssid;
 String param_password;
 

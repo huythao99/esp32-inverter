@@ -87,6 +87,7 @@ extern String MQTT_TOPIC_CMD_SCHEDULE;
 extern String MQTT_TOPIC_SHARE;
 extern String MQTT_TOPIC_BLACKLIST;
 extern String MQTT_TOPIC_CMD_GRID_TIE;
+extern String MQTT_TOPIC_CMD_STM_PROTOCOL;
 extern String MQTT_TOPIC_CMD_RESTART;
 extern String MQTT_TOPIC_CMD_UART_DEBUG;   // server -> device: {"minutes":N}
 extern String MQTT_TOPIC_DEBUG_UART;       // device -> server: raw STM32 lines
@@ -139,6 +140,23 @@ extern volatile bool  unlockPending;
 // applyCurrentValue(); both on Core 1, so no mutex.
 extern volatile bool  gridTieOff;
 extern const char* const GRID_TIE_OFF_OUT;
+
+// ---- STM32 link protocol --------------------------------------------------
+// NEW    : "*VVVV@PPPP#" written straight to the UART (STM32 firmware since
+//          06/2025).
+// LEGACY : the first boards (esp-32 firmware before 06/2025): handshake on
+//          STM_START (GPIO2, ESP->STM) / STM_READY (GPIO14, STM->ESP) and the
+//          raw 8-digit value "VVVVPPPP" (no '*', '@', '#').
+// stmProtoSetting comes from the server (retained cmd/stm-protocol, kept in
+// NVS): 0 = auto (detected at boot), 1 = force NEW, 2 = force LEGACY.
+// stmLegacy is the mode in use. Both only touched on Core 1.
+enum : uint8_t { STM_PROTO_AUTO = 0, STM_PROTO_NEW = 1, STM_PROTO_LEGACY = 2 };
+extern volatile uint8_t stmProtoSetting;
+extern volatile bool    stmLegacyDetected;
+extern volatile bool    stmLegacy;
+// LEGACY has no lock command: a blacklisted device gets this "off" value
+// (the same one the server serves for blacklisted devices).
+extern const char* const LEGACY_LOCK_VALUE;
 
 // ---- Identity / config ----------------------------------------------------
 extern String uid;
