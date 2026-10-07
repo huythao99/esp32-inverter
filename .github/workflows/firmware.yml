@@ -5,6 +5,10 @@
 # Staged Rollout). A version that already exists in the CMS is never
 # re-uploaded (the backend refuses to overwrite a version anyway).
 #
+# Release notes for users (app / web "Có gì mới"): the "## <version>" section of
+# RELEASE_NOTES.md is sent with the upload. Editing the section of a version
+# that is already in the CMS and pushing to main updates it there too.
+#
 # Repository secrets:
 #   CMS_API_URL    https://giabao-inverter.com
 #   CMS_USERNAME   CMS admin account used by CI (create a dedicated one)
@@ -19,6 +23,7 @@ on:
       - 'include/**'
       - 'lib/**'
       - 'platformio.ini'
+      - 'RELEASE_NOTES.md'
       - '.github/workflows/firmware.yml'
   workflow_dispatch:
     inputs:
@@ -69,12 +74,34 @@ jobs:
           if [ "$VERSION" != "$PREV" ] || [ "${{ inputs.force || false }}" = "true" ]; then
             CHANGED=true
           fi
+          # Release notes: the "## $VERSION" section of RELEASE_NOTES.md
+          # (blank lines around it trimmed). Empty = none.
+          NOTES_FILE="$RUNNER_TEMP/release_notes.txt"
+          if [ -f RELEASE_NOTES.md ]; then
+            awk -v v="$VERSION" '
+              /^## / { p = ($2 == v); next }
+              p' RELEASE_NOTES.md | sed -e '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' > "$NOTES_FILE"
+          else
+            : > "$NOTES_FILE"
+          fi
+          NOTES_CHANGED=false
+          if [ -s "$NOTES_FILE" ]; then
+            if [ -z "$PREV" ] || ! git diff --quiet "$BEFORE" HEAD -- RELEASE_NOTES.md 2>/dev/null; then
+              NOTES_CHANGED=true
+            fi
+            [ "${{ inputs.force || false }}" = "true" ] && NOTES_CHANGED=true
+            echo "Release notes of $VERSION:"; cat "$NOTES_FILE"
+          else
+            echo "::notice::RELEASE_NOTES.md has no '## $VERSION' section - users see no release notes"
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
-          echo "Version: ${PREV:-?} -> $VERSION (changed=$CHANGED)"
+          echo "notes_changed=$NOTES_CHANGED" >> "$GITHUB_OUTPUT"
+          echo "notes_file=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+          echo "Version: ${PREV:-?} -> $VERSION (changed=$CHANGED, notes_changed=$NOTES_CHANGED)"
 
       - name: Log in to the CMS
-        if: steps.ver.outputs.changed == 'true'
+        if: steps.ver.outputs.changed == 'true' || steps.ver.outputs.notes_changed == 'true'
         id: login
         shell: bash
         env:
@@ -98,7 +125,7 @@ jobs:
           echo "$TOKEN" > "$RUNNER_TEMP/cms_token"
 
       - name: Skip if already in the CMS
-        if: steps.ver.outputs.changed == 'true'
+        if: steps.ver.outputs.changed == 'true' || steps.ver.outputs.notes_changed == 'true'
         id: exists
         shell: bash
         env:
@@ -109,9 +136,11 @@ jobs:
           TOKEN=$(cat "$RUNNER_TEMP/cms_token")
           LIST=$(curl -sS --fail-with-body "$CMS_API_URL/api/cms/esp-firmwares?product=$PRODUCT" \
             -H "Authorization: Bearer $TOKEN")
-          if echo "$LIST" | jq -e --arg v "$VERSION" 'map(select(.version == $v)) | length > 0' >/dev/null; then
+          ID=$(echo "$LIST" | jq -r --arg v "$VERSION" 'map(select(.version == $v)) | .[0]._id // empty')
+          if [ -n "$ID" ]; then
             echo "::notice::$PRODUCT v$VERSION is already in the CMS - nothing to upload"
             echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "id=$ID" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
@@ -170,12 +199,31 @@ jobs:
             -F "product=$PRODUCT" \
             -F "version=$VERSION" \
             -F "activate=beta" \
-            -F "notes=$NOTES") || { echo "::error::upload failed: $RES"; exit 1; }
+            -F "notes=$NOTES" \
+            -F "releaseNotes=<${{ steps.ver.outputs.notes_file }}") || { echo "::error::upload failed: $RES"; exit 1; }
           echo "$RES" | jq '{version, channels, size, sha256, warning}'
           WARN=$(echo "$RES" | jq -r '.warning // empty')
           [ -z "$WARN" ] || echo "::warning::$WARN"
           echo "### $PRODUCT v$VERSION uploaded and set as **beta**" >> "$GITHUB_STEP_SUMMARY"
           echo "Promote it in the CMS (ESP32 Firmware -> Set stable, or Staged Rollout)." >> "$GITHUB_STEP_SUMMARY"
+
+      # Version already in the CMS (e.g. only RELEASE_NOTES.md changed):
+      # update its release notes there.
+      - name: Update release notes in the CMS
+        if: steps.exists.outputs.found == 'true' && steps.ver.outputs.notes_changed == 'true'
+        shell: bash
+        env:
+          CMS_API_URL: ${{ secrets.CMS_API_URL }}
+          ID: ${{ steps.exists.outputs.id }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(cat "$RUNNER_TEMP/cms_token")
+          BODY=$(jq -n --rawfile n "${{ steps.ver.outputs.notes_file }}" '{releaseNotes: $n}')
+          curl -sS --fail-with-body -X PATCH "$CMS_API_URL/api/cms/esp-firmwares/$ID" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d "$BODY" >/dev/null || { echo "::error::could not update the release notes"; exit 1; }
+          echo "### Release notes of $PRODUCT v$VERSION updated in the CMS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Tag the release
         if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
