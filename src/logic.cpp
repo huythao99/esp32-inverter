@@ -217,13 +217,20 @@ String toLegacyValue(const String& out) {
 
 static void noteWritten(const String& out);   // echo check (below)
 
+static String s_legacyOut = "";            // command s_legacyValue was made from
+
 static void legacyWrite(const String& out) {
-  const String raw = toLegacyValue(out);
-  if (raw.isEmpty()) return;
-  if (raw != s_legacyValue) {
-    s_legacyValue = raw;
-    digitalWrite(STM_START, HIGH);       // "new value": ask the STM32 to take it
+  // Convert only when the command changes (no String churn every second).
+  if (out != s_legacyOut) {
+    s_legacyOut = out;
+    const String raw = toLegacyValue(out);
+    if (raw != s_legacyValue) {
+      s_legacyValue = raw;
+      if (!raw.isEmpty()) digitalWrite(STM_START, HIGH);   // "new value"
+    }
   }
+  const String& raw = s_legacyValue;
+  if (raw.isEmpty()) return;
   const unsigned long now = millis();
   if (now - s_legacyWriteAt < kLegacyWriteMinMs) return;
   if (digitalRead(STM_READY) != HIGH) return;   // STM32 not ready yet
@@ -238,8 +245,10 @@ static void legacyWrite(const String& out) {
 // AUTO detection, confirmed by the STM32's own echo.
 //
 // The STM32 reports the cut-off / limit it is running in frame fields 7 and 8
-// ("...#48.50#1600.00"). A pin level alone is not proof (a new board may also
-// hold GPIO14 high), so:
+// ("...#48.50#1600.00"). Seeing the current value there proves nothing (the
+// STM32 may still hold it from before, e.g. written over the other protocol),
+// so while detecting, the limit sent is offset by a few watts (s_probeDelta,
+// random 2..4 W) and only that probe value coming back counts:
 //   1. TRY_NEW    : always start with "*VVVV@PPPP#". 3 frames echoing the
 //                   command -> CONFIRMED new.
 //   2. If the echo stays wrong >= kTryNewMs after the command was written AND
@@ -255,33 +264,43 @@ static AutoPhase     s_autoPhase = AP_TRY_NEW;
 static unsigned long s_phaseAt = 0;           // phase start
 static unsigned long s_nextLegacyTryAt = 0;   // backoff after a failed legacy try
 static int           s_echoOk = 0;
-static String        s_echoCmd = "";          // last command written to the STM32
+// Last *VVVV@PPPP# written to the STM32, kept as numbers (no heap use):
+// cut-off in 1/100 V, limit in W. s_echoHave = false: nothing to compare
+// (nothing written yet, or a lock/unlock command).
+static bool          s_echoHave = false;
+static long          s_echoCut = 0;
+static long          s_echoLim = 0;
 static unsigned long s_echoCmdAt = 0;         // when it was first written
 static const unsigned long kEchoSettleMs   = 4000;
 static const unsigned long kTryNewMs       = 20000;
 static const unsigned long kTryLegacyMs    = 40000;
 static const unsigned long kRetryLegacyMs  = 600000;
 static const int           kEchoConfirm    = 3;
+static int                 s_probeDelta    = 3;   // W, set at boot
 
 static bool        s_protoLogPending = true;
 static const char* s_protoSource = "auto";
 
 // Called whenever a command actually goes out on the UART (both modes).
 static void noteWritten(const String& out) {
-  if (out != s_echoCmd) {
-    s_echoCmd = out;
+  long cut = 0, lim = 0;
+  bool have = false;
+  const char* c = out.c_str();
+  if (c[0] == '*' && c[1] >= '0' && c[1] <= '9') {   // not *LOCK / *UNLOCK
+    char* end = nullptr;
+    cut = strtol(c + 1, &end, 10);
+    if (end && *end == '@') {
+      lim = strtol(end + 1, &end, 10) - 1000;
+      have = end && *end == '#';
+    }
+  }
+  if (have != s_echoHave || cut != s_echoCut || lim != s_echoLim) {
+    s_echoHave = have;
+    s_echoCut = cut;
+    s_echoLim = lim;
     s_echoCmdAt = millis();
     s_echoOk = 0;
   }
-}
-
-// GPIO14 pull-down only while it matters (legacy handshake / AUTO still
-// checking). Once the board runs NEW for sure, back to plain INPUT exactly
-// like the firmware before 1.1.3, so a new board sees no electrical change.
-static void applyReadyPin() {
-  const bool sense = stmLegacy ||
-      (stmProtoSetting == STM_PROTO_AUTO && s_autoPhase != AP_CONFIRMED);
-  pinMode(STM_READY, sense ? INPUT_PULLDOWN : INPUT);
 }
 
 static void setLegacy(bool legacy) {
@@ -289,8 +308,9 @@ static void setLegacy(bool legacy) {
   stmLegacy = legacy;
   s_lastWrittenValue = "";             // re-send in the new format at once
   s_legacyValue = "";
+  s_legacyOut = "";
   s_legacyWriteAt = 0;
-  s_echoCmd = "";
+  s_echoHave = false;
   s_echoOk = 0;
   digitalWrite(STM_START, LOW);
 }
@@ -298,7 +318,11 @@ static void setLegacy(bool legacy) {
 bool detectLegacyStm() {
   // Pin setup only; the decision is made from the STM32's echo (above).
   // Returns the hint of the previous boot (NVS): try legacy first.
-  pinMode(STM_READY, INPUT_PULLDOWN);
+  s_probeDelta = 2 + (int)(esp_random() % 3);
+  // Plain INPUT, exactly like the esp-32 (Firebase) firmware: a first-gen
+  // STM32 that drives READY weakly is not pulled low. A floating pin reading
+  // HIGH by noise only costs a 40 s legacy try (the echo decides).
+  pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
   digitalWrite(STM_START, LOW);
   return loadStmLegacyHint();
@@ -315,41 +339,52 @@ void updateStmProtocol(const char* source) {
     s_phaseAt = millis();
     setLegacy(stmLegacyDetected);
   }
-  applyReadyPin();
   s_protoSource = source;
   s_protoLogPending = true;
 }
 
-// "a#b#c#d#e#f#CUTOFF#LIMIT[#...]" -> did the STM32 take s_echoCmd?
-static int echoMatches(const String& frame) {
-  if (s_echoCmd.length() < 4 || s_echoCmd[0] != '*' ||
-      s_echoCmd.startsWith("*LOCK") || s_echoCmd.startsWith("*UNLOCK")) {
-    return -1;                          // nothing to compare against
+// While AUTO is still detecting: the command with its limit moved by
+// s_probeDelta W (down, or up for a limit <= 10 W such as grid-tie OFF), so
+// its echo cannot be a value the STM32 already had. Lock/unlock untouched.
+static String probeValue(const String& out) {
+  if (stmProtoSetting != STM_PROTO_AUTO || s_autoPhase == AP_CONFIRMED) return out;
+  if (out.length() < 4 || out[0] != '*' ||
+      out.startsWith("*LOCK") || out.startsWith("*UNLOCK")) {
+    return out;
   }
-  const int at = s_echoCmd.indexOf('@');
-  const int hash = s_echoCmd.indexOf('#');
-  if (at < 2 || hash <= at + 1) return -1;
-  const float wantCut = s_echoCmd.substring(1, at).toInt() / 100.0f;
-  const float wantLim = (float)(s_echoCmd.substring(at + 1, hash).toInt() - 1000);
+  const int at = out.indexOf('@');
+  const int hash = out.indexOf('#');
+  if (at < 2 || hash <= at + 1) return out;
+  const long w = out.substring(at + 1, hash).toInt() - 1000;
+  const long pw = w > 10 ? w - s_probeDelta : w + s_probeDelta;
+  return out.substring(0, at + 1) + String(pw + 1000) + "#";
+}
 
-  int idx = 0, from = 0;
-  float cut = NAN, lim = NAN;
-  while (idx <= 7) {
-    int sep = frame.indexOf('#', from);
-    String f = sep < 0 ? frame.substring(from) : frame.substring(from, sep);
-    if (idx == 6) cut = f.toFloat();
-    if (idx == 7) { lim = f.toFloat(); break; }
-    if (sep < 0) return -1;
-    from = sep + 1;
-    idx++;
+// "a#b#c#d#e#f#CUTOFF#LIMIT[#...]" -> did the STM32 take the last command?
+// Parsed in place (strtod on the frame buffer): no heap allocation per frame.
+static int echoMatches(const String& frame) {
+  if (!s_echoHave) return -1;           // nothing to compare against
+  const char* p = frame.c_str();
+  if (*p == '$') p++;
+  for (int idx = 0; idx < 6; idx++) {   // skip fields 1..6
+    p = strchr(p, '#');
+    if (!p) return -1;
+    p++;
   }
-  if (isnan(cut) || isnan(lim)) return -1;
-  return (fabsf(cut - wantCut) < 0.06f && fabsf(lim - wantLim) < 1.5f) ? 1 : 0;
+  char* end = nullptr;
+  const double cut = strtod(p, &end);
+  if (end == p || *end != '#') return -1;
+  p = end + 1;
+  const double lim = strtod(p, &end);
+  if (end == p) return -1;
+  // Exact watt: the probe differs from the real value by only 2..4 W.
+  return (fabs(cut - s_echoCut / 100.0) < 0.06 && fabs(lim - s_echoLim) < 0.6)
+             ? 1 : 0;
 }
 
 void stmProtoOnFrame(const String& frame) {
   if (stmProtoSetting != STM_PROTO_AUTO || s_autoPhase == AP_CONFIRMED) return;
-  if (s_echoCmd.isEmpty() || millis() - s_echoCmdAt < kEchoSettleMs) return;
+  if (!s_echoHave || millis() - s_echoCmdAt < kEchoSettleMs) return;
   const int m = echoMatches(frame);
   if (m < 0) return;
   if (m == 0) { s_echoOk = 0; return; }
@@ -361,7 +396,6 @@ void stmProtoOnFrame(const String& frame) {
     stmLegacyDetected = legacy;
     saveStmLegacyHint(legacy);
   }
-  applyReadyPin();
   s_protoSource = legacy ? "auto-legacy" : "auto-new";
   s_protoLogPending = true;
 }
@@ -371,7 +405,7 @@ void stmProtocolTick(unsigned long now) {
     if (s_autoPhase == AP_TRY_NEW) {
       // Echo still wrong long after the command went out + a legacy board's
       // READY line is up -> try the handshake.
-      if (!s_echoCmd.isEmpty() && s_echoOk == 0 &&
+      if (s_echoHave && s_echoOk == 0 &&
           now - s_echoCmdAt >= kTryNewMs && now - s_phaseAt >= kTryNewMs &&
           (long)(now - s_nextLegacyTryAt) >= 0 &&
           digitalRead(STM_READY) == HIGH) {
@@ -391,8 +425,7 @@ void stmProtocolTick(unsigned long now) {
         stmLegacyDetected = false;
         saveStmLegacyHint(false);
       }
-      applyReadyPin();
-      s_protoSource = "auto-revert-new";
+          s_protoSource = "auto-revert-new";
       s_protoLogPending = true;
     }
   }
@@ -473,6 +506,8 @@ void applyCurrentValue() {
     s_lastLoggedSource = source;
     trackLog("SOURCE_CHANGE", "source=" + String(source) + " value=" + out, 300000);
   }
+
+  out = probeValue(out);   // AUTO still detecting: limit offset by a few W
 
   if (stmLegacy) {
     legacyWrite(out);

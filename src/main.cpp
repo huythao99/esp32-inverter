@@ -747,7 +747,10 @@ void loop() {
 
   while (!stmUartBusy && testSerial.available()) {
     char c = (char)testSerial.read();
-    if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
+    // '$': end of frame of some first-generation STM32 builds ("*...$",
+    // read by the esp-32 firmware of 05/2025); without it the frame would
+    // carry a '$' and be rejected as a bad character.
+    if (c == '*' || c == '$' || c == '\0' || c == '\n' || c == '\r') {
       // A HW receive error (bit error / break) happened while this frame was
       // on the wire. Consumed per frame so it never leaks into the next.
       bool hwError = s_uartErrorInFrame;
