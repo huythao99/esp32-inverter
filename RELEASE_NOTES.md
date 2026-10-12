@@ -9,8 +9,9 @@ gửi lên CMS cùng bản firmware. Sửa nội dung một mục đã phát hà
 `main` thì CMS cũng được cập nhật theo. Phiên bản không có mục ở đây thì không
 hiện gì cho khách (vẫn có thể viết trực tiếp trên CMS).
 
-## 1.1.6
+## 1.1.3
 - Hỗ trợ bo mạch công suất đời đầu: thiết bị tự nhận ra loại bo và giao tiếp đúng cách
 - Sửa lỗi thiết bị cũ không phát điện sau khi cập nhật firmware
 - Thêm điều khiển bật/tắt hoà lưới từ xa
+- Khi chia tải trong khung giờ lập lịch, điện áp cắt lấy theo lịch thay vì theo cài đặt
 - Giảm sử dụng bộ nhớ, chạy ổn định hơn
