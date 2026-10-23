@@ -1,20 +1,17 @@
 #pragma once
 
 #include <Arduino.h>
+#include <device_api.h>      // esp32-common: deviceApiRequest, trackLogError, trackLogRL
 
 // ---------------------------------------------------------------------------
 // Blocking HTTP / OTA. EVERY function here runs on the Core 0 worker task only
-// (they share a single HTTPClient instance). Never call these from loop()/Core 1
-// — enqueue a Job via worker.h instead.
+// (device_api.h shares one HTTPClient). Never call these from loop()/Core 1 —
+// enqueue a Job via worker.h instead.
 // ---------------------------------------------------------------------------
 
-// Configure the shared HTTPClient (call once from setup, before the task starts).
+// Configure device_api (call once from setup, before the worker starts). The
+// clock is also set from the HTTP Date header while NTP has not answered.
 void netHttpInit();
-
-// Error reporting (Core 0). trackLogError posts immediately; trackLogRL is the
-// rate-limited variant used internally and by the JOB_LOG handler.
-bool trackLogError(const String& errorCode, const String& errorMessage);
-bool trackLogRL(const String& code, const String& message, unsigned long cooldownMs = 60000);
 
 // Backend fetches. Update shared state (lastSetupValue / schedules[]) under stateMutex.
 String getDeviceSettings(const String& deviceUid, const String& deviceSSID);
@@ -22,9 +19,7 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID);
 bool   registerDevice(const String& deviceId, const String& deviceName, const String& userId);
 bool   updateFirmwareVersion(const String& firmwareVersion);
 
-// OTA.
-String getFirmwareS3URL(const String& version = "latest");
-bool   performFOTAUpdate(const String& firmwareURL);
+// ESP32 OTA (esp_ota.h): firmware URL from /api/firmware, then install.
 void   handleFirmwareUpdate();
 
 // Enqueue an OTA/status JSON line for Core 1 to publish over MQTT. Safe from any

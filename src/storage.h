@@ -14,9 +14,7 @@ void   readWifi();
 // Cached UID accessor (lazily parses EEPROM on first call).
 String getUid();
 
-// Base setting value persistence (NVS).
-void   saveSettingToStorage(const String& value);
-String loadSettingFromStorage();
+// Cloud setting / broadcast SSID (NVS): esp32-common nvs_store.h.
 
 // Schedule persistence (NVS): the raw schedule string from the server, so a
 // rebooted device keeps running its schedule even if the server/API is not
@@ -39,6 +37,3 @@ uint8_t loadStmProtocol();
 void    saveStmLegacyHint(bool legacy);
 bool    loadStmLegacyHint();
 
-// Broadcast SSID persistence (NVS) — set once, survives firmware uploads.
-void   saveWifiBroadcastSSID(const String& ssid);
-String loadWifiBroadcastSSID();

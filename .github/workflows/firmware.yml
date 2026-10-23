@@ -13,6 +13,7 @@
 #   CMS_API_URL    https://giabao-inverter.com
 #   CMS_USERNAME   CMS admin account used by CI (create a dedicated one)
 #   CMS_PASSWORD
+#   ESP32_COMMON_DEPLOY_KEY  deploy key (read-only) of the private esp32-common repo
 name: Firmware (beta)
 
 on:
@@ -144,6 +145,12 @@ jobs:
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: SSH key for the private esp32-common library
+        if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.ESP32_COMMON_DEPLOY_KEY }}
 
       - name: Set up Python
         if: steps.ver.outputs.changed == 'true' && steps.exists.outputs.found != 'true'

@@ -121,31 +121,6 @@ String buildShareValue(int shareWatts, const String& base) {
   return "*" + pset + "@" + String(value) + "#";
 }
 
-String jsonEscape(const String& in) {
-  String out;
-  out.reserve(in.length() + 8);
-  for (unsigned int i = 0; i < in.length(); i++) {
-    char c = in[i];
-    if (c == '"' || c == '\\') {
-      out += '\\';
-      out += c;
-    } else if (c == '\n') {
-      out += "\\n";
-    } else if (c == '\r') {
-      out += "\\r";
-    } else if (c == '\t') {
-      out += "\\t";
-    } else {
-      out += c;
-    }
-  }
-  return out;
-}
-
-String createSignedMessage(const String& payload) {
-  return payload;
-}
-
 void onNtpSync(struct timeval* tv) {
   isNtpSynced = true;
   // Do NOT do HTTP here — this runs on the SNTP task, not loop().
@@ -154,36 +129,6 @@ void onNtpSync(struct timeval* tv) {
 bool isTimeValid() {
   // Any date after 2023-11-14 means the clock was set (it boots at 1970).
   return time(nullptr) > 1700000000;
-}
-
-// Days since 1970-01-01 for a proleptic Gregorian date (H. Hinnant's algorithm).
-static long daysFromCivil(int y, unsigned m, unsigned d) {
-  y -= m <= 2;
-  const long era = (y >= 0 ? y : y - 399) / 400;
-  const unsigned yoe = (unsigned)(y - era * 400);
-  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
-  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-  return era * 146097 + (long)doe - 719468;
-}
-
-time_t parseHttpDate(const String& s) {
-  // "Wed, 23 Sep 2026 08:12:34 GMT"
-  int day = 0, year = 0, hh = 0, mm = 0, ss = 0;
-  char mon[4] = {0};
-  const char* p = strchr(s.c_str(), ',');
-  if (!p) return 0;
-  if (sscanf(p + 1, " %d %3s %d %d:%d:%d", &day, mon, &year, &hh, &mm, &ss) != 6) return 0;
-  static const char* kMonths[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  int month = 0;
-  for (int i = 0; i < 12; i++) {
-    if (strncmp(mon, kMonths[i], 3) == 0) { month = i + 1; break; }
-  }
-  if (month == 0 || day < 1 || day > 31 || year < 2020 || year > 2100 ||
-      hh > 23 || mm > 59 || ss > 60) {
-    return 0;
-  }
-  return (time_t)(daysFromCivil(year, month, day) * 86400L + hh * 3600L + mm * 60L + ss);
 }
 
 // ---------------------------------------------------------------------------

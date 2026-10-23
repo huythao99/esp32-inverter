@@ -81,20 +81,6 @@ String getUid() {
   return uid;
 }
 
-void saveSettingToStorage(const String& value) {
-  if (value.isEmpty()) return;
-  preferences.begin("device_setting", false);
-  preferences.putString("setup_value", value);
-  preferences.end();
-}
-
-String loadSettingFromStorage() {
-  preferences.begin("device_setting", true);
-  String value = preferences.getString("setup_value", "");
-  preferences.end();
-  return value;
-}
-
 // Last schedule written to / read from NVS, to skip identical writes: the
 // schedule is re-fetched every 60 s but rarely changes.
 static String s_storedSchedule;
@@ -180,17 +166,4 @@ bool loadStmLegacyHint() {
     p.end();
   }
   return legacy;
-}
-
-void saveWifiBroadcastSSID(const String& ssid) {
-  preferences.begin("wifi_config", false);
-  preferences.putString("broadcast_ssid", ssid);
-  preferences.end();
-}
-
-String loadWifiBroadcastSSID() {
-  preferences.begin("wifi_config", true);
-  String ssid = preferences.getString("broadcast_ssid", WIFI_BROADCAST_SSID);
-  preferences.end();
-  return ssid;
 }

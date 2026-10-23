@@ -13,5 +13,6 @@ hiện gì cho khách (vẫn có thể viết trực tiếp trên CMS).
 - Hỗ trợ bo mạch công suất đời đầu: thiết bị tự nhận ra loại bo và giao tiếp đúng cách
 - Sửa lỗi thiết bị cũ không phát điện sau khi cập nhật firmware
 - Thêm điều khiển bật/tắt hoà lưới từ xa
+- Sửa lỗi bật lại hoà lưới nhưng thiết bị vẫn chạy ở mức tắt (99 V / 1 W)
 - Khi chia tải trong khung giờ lập lịch, điện áp cắt lấy theo lịch thay vì theo cài đặt
 - Giảm sử dụng bộ nhớ, chạy ổn định hơn

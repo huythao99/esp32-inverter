@@ -1,16 +1,22 @@
 #pragma once
 
 #include <Arduino.h>
+#include <stm_fota_runner.h>   // esp32-common: runner, UART hand-over, reported version
 
 // ---------------------------------------------------------------------------
 // STM32 FOTA: flash the power board's STM32 through the existing UART link,
-// using the STM32 team's protocol (gti_fota.h). Backend contract:
-// nestjs-app/docs/STM32_FOTA.md.
+// using the STM32 team's protocol (gti_fota.h). The update itself is the shared
+// runner (esp32-common stm_fota_runner.h); this is the inverter's glue.
+// Backend contract: nestjs-app/docs/STM32_FOTA.md.
 //
 //   MQTT  inverter/{uid}/{id}/stm/update       server -> device (trigger)
 //   HTTP  GET /api/stm-firmware?deviceId&userId  image url/size/crc32
 //   MQTT  inverter/{uid}/{id}/stm/ota/status   device -> server (progress)
 //   HTTP  PATCH /api/stm-firmware/info/{uid}/{id}  version after success
+//
+// The STM32 version comes from telemetry field 13 (main.cpp ->
+// stmSetReportedVersion). First-generation boards (stmLegacy) have no FOTA
+// bootloader: triggers are refused.
 //
 // Threading:
 //   - The MQTT callback (Core 1) only parses the trigger (stmFotaOnTrigger).
@@ -19,16 +25,8 @@
 //   - The whole update runs on the Core 0 worker (stmFotaRun).
 // ---------------------------------------------------------------------------
 
-// UART hand-over. Core 0 sets stmUartRequest and waits for stmUartReleased;
-// from then on Core 1 neither reads nor writes testSerial. Clearing
-// stmUartRequest gives the UART back; Core 1 resyncs and clears stmUartReleased.
-extern volatile bool stmUartRequest;
-extern volatile bool stmUartReleased;
-
-// STM32 firmware version seen in telemetry field 13 ("x.y.z"), Core 1 writes.
-void   stmSetReportedVersion(const String& version);
-String stmReportedVersion();            // "" if never seen
-unsigned long stmReportedVersionAt();   // millis() of the last report, 0 = never
+// setup(): configure the runner (UART, API paths, status queue).
+void stmFotaSetup();
 
 // MQTT trigger payload {"action":"stm_update","version","crc32","force","ts"}.
 // Called from the MQTT callback (Core 1): parse only.

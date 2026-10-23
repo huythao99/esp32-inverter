@@ -35,9 +35,8 @@ void applyCurrentValue();
 // ---- STM32 link protocol (legacy writer + AUTO detection) -----------------
 #include "logic_legacy.h"
 
-// JSON helpers.
-String jsonEscape(const String& in);
-String createSignedMessage(const String& payload);
+// jsonEscape(): esp32-common json_util.h.
+#include <json_util.h>
 
 // SNTP sync callback (sets isNtpSynced).
 void onNtpSync(struct timeval* tv);
@@ -47,6 +46,5 @@ void onNtpSync(struct timeval* tv);
 // time-based logic such as schedules may run.
 bool isTimeValid();
 
-// Parse an HTTP `Date` header (RFC 7231, e.g. "Wed, 23 Sep 2026 08:12:34 GMT")
-// into UTC epoch seconds. Returns 0 if it cannot be parsed.
-time_t parseHttpDate(const String& s);
+// parseHttpDate(): esp32-common device_api.h (the HTTP Date clock fallback
+// itself is done by deviceApiRequest, see netHttpInit()).

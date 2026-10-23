@@ -46,8 +46,6 @@
 #define MQTT_USERNAME "giabao"
 #define MQTT_PASSWORD "0918273645"
 
-// SHA256 Authentication Key
-#define SHA_SECRET_KEY "K8mN2pQ7vX4bE9fH3gJ6kL1mP5sT8wZ2"
 
 // API base
 #define API_BASE "https://giabao-inverter.com"

@@ -14,15 +14,22 @@
 #include "net_http.h"
 #include "net_mqtt.h"
 #include "worker.h"
-#include "ota_health.h"
-#include "wifi_page.h"
+#include <ota_health.h>      // esp32-common
+#include <wifi_page.h>       // esp32-common
+#include <nvs_store.h>       // esp32-common
 #include "stm_fota.h"
-#include "ca_certs.h"
+#include <ca_certs.h>        // esp32-common
 
 // Task Watchdog timeout for the loop (Core 1). Must exceed the longest legitimate
 // blocking section on Core 1 (MQTT connect bounded to 8s, WiFi scan ~1.5s, AP mode
 // toggle ~4s) so it only fires on a genuine hang.
 static const uint32_t WDT_TIMEOUT_S = 20;
+
+// ota_health (esp32-common) reports through the app's log.
+static void logOtaHealth(const char* code, const char* message) {
+  DBG_PRINT("[OTA] "); DBG_PRINT(code); DBG_PRINT(": "); DBG_PRINTLN(message);
+  trackLog(code, message);
+}
 
 // ---------------------------------------------------------------------------
 // Core 1 (Arduino loop): MQTT, STM32 serial, applyCurrentValue(), web server.
@@ -542,14 +549,13 @@ void setup() {
   EEPROM.begin(512);
 
   // Load WIFI_BROADCAST_SSID from Preferences (never changes once saved).
-  wifiBroadcastSSID = loadWifiBroadcastSSID();
+  wifiBroadcastSSID = nvsLoadBroadcastSsid(WIFI_BROADCAST_SSID);
   preferences.begin("wifi_config", true);
-  if (!preferences.isKey("broadcast_ssid")) {
-    preferences.end();
+  const bool ssidSaved = preferences.isKey("broadcast_ssid");
+  preferences.end();
+  if (!ssidSaved) {
     wifiBroadcastSSID = WIFI_BROADCAST_SSID;
-    saveWifiBroadcastSSID(wifiBroadcastSSID);
-  } else {
-    preferences.end();
+    nvsSaveBroadcastSsid(wifiBroadcastSSID);
   }
   if (wifiBroadcastSSID.isEmpty()) {
     wifiBroadcastSSID = WIFI_BROADCAST_SSID;
@@ -571,7 +577,7 @@ void setup() {
   readWifi();
 
   // Load last setting from storage on startup.
-  lastSetupValue = loadSettingFromStorage();
+  lastSetupValue = nvsLoadSetting();
   if (!lastSetupValue.isEmpty()) {
     DBG_PRINT("Loaded setting from storage: ");
     DBG_PRINTLN(lastSetupValue);
@@ -594,6 +600,7 @@ void setup() {
   if (gridTieOff) DBG_PRINTLN("Grid-tie OFF (from storage)");
 
   netHttpInit();
+  stmFotaSetup();
 
   // MQTT init
   // Server/port + transport (TLS 8883 or plain 1883) are chosen on every
@@ -624,6 +631,7 @@ void setup() {
   esp_task_wdt_add(NULL);                  // watch the current (loop) task
 
   // Detect a freshly-OTA'd image still awaiting health confirmation.
+  otaHealthSetLogger(logOtaHealth);
   otaHealthBegin();
 
   // Remember why a setup connect attempt failed (reported by /connect-status).
@@ -1076,8 +1084,7 @@ void loop() {
       DBG_PRINTLN(jsonString);
 
       if (!MQTT_TOPIC_DATA.isEmpty()) {
-        String signedJsonString = createSignedMessage(jsonString);
-        bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
+        bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), jsonString.c_str());
         DBG_PRINT("[STM32] publish ");
         DBG_PRINT(jsonString);
         DBG_PRINT(" -> ");
@@ -1113,8 +1120,7 @@ void loop() {
       }
       statusMsg += "\"status\":\"online\",\"uptime\":" + String(currentMillis / 1000) +
                    ",\"stm\":\"" + (stmLegacy ? "legacy" : "new") + "\"}";
-      String signedStatusMsg = createSignedMessage(statusMsg);
-      mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
+      mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), statusMsg.c_str());
     }
   }
 
