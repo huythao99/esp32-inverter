@@ -18,6 +18,11 @@
 #endif
 
 #define WIFI_BROADCAST_SSID "GTIControl1370"
+// Name prefixes (hybrid <-> inverter conversion by OTA, see main.cpp).
+#define GTI_SSID_PREFIX "GTIControl"
+#define HYBRID_SSID_PREFIX "HybridControl"
+// OTA confirm of a board without home WiFi (main.cpp otaHealthTick).
+#define OTA_UNCONFIGURED_OK_MS 90000UL
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"

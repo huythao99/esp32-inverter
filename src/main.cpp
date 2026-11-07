@@ -560,6 +560,18 @@ void setup() {
   if (wifiBroadcastSSID.isEmpty()) {
     wifiBroadcastSSID = WIFI_BROADCAST_SSID;
   }
+  // Running under a hybrid name: a board converted to hybrid (CMS) that came
+  // back to this firmware without being renamed (hybrid <= 1.3.1 rolled back
+  // to it, NVS is shared). Same number, inverter prefix. (A hybrid >= 1.3.4
+  // converting to inverter writes the GTIControl name itself before the OTA.)
+  if (wifiBroadcastSSID.startsWith(HYBRID_SSID_PREFIX)) {
+    String renamed = String(GTI_SSID_PREFIX) +
+                     wifiBroadcastSSID.substring(strlen(HYBRID_SSID_PREFIX));
+    DBG_PRINT("Renamed from the hybrid: "); DBG_PRINT(wifiBroadcastSSID);
+    DBG_PRINT(" -> "); DBG_PRINTLN(renamed);
+    wifiBroadcastSSID = renamed;
+    nvsSaveBroadcastSsid(wifiBroadcastSSID);
+  }
 
   WiFi.softAP(wifiBroadcastSSID.c_str(), "", 6);
   DBG_PRINT("Access Point SSID: ");
@@ -817,7 +829,12 @@ void loop() {
   }
 
   // Confirm a freshly-OTA'd image once it's healthy (WiFi + MQTT up).
-  otaHealthTick(WiFi.status() == WL_CONNECTED && mqttClient.connected());
+  // A board with no home WiFi yet (e.g. a hybrid just converted to this
+  // firmware by OTA, waiting to be added in the app) can't reach MQTT: any
+  // reboot meanwhile would roll it back. For it, running
+  // OTA_UNCONFIGURED_OK_MS without a crash / WDT reset is enough.
+  otaHealthTick((WiFi.status() == WL_CONNECTED && mqttClient.connected()) ||
+                (param_ssid.isEmpty() && millis() >= OTA_UNCONFIGURED_OK_MS));
 
   // Report firmware version once we're online — throttled + delegated to Core 0.
   if (!isUpdateVersion && WiFi.status() == WL_CONNECTED && isMqttConnected) {
