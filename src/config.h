@@ -17,7 +17,7 @@
   #define DBG_PRINTLN(...) do {} while (0)
 #endif
 
-#define WIFI_BROADCAST_SSID "GTIControl1370"
+#define WIFI_BROADCAST_SSID "GTIControl1377"
 // Name prefixes (hybrid <-> inverter conversion by OTA, see main.cpp).
 #define GTI_SSID_PREFIX "GTIControl"
 #define HYBRID_SSID_PREFIX "HybridControl"
